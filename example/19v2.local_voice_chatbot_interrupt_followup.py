@@ -8,6 +8,7 @@ import random
 import re
 import signal
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -275,6 +276,14 @@ HEAD_CENTER_ON_STARTUP = os.getenv("HEAD_CENTER_ON_STARTUP", "0") != "0"
 HEAD_LAZY_INIT = os.getenv("HEAD_LAZY_INIT", "1") != "0"
 TTS_SYNC_TIMEOUT_SECONDS = float(os.getenv("TTS_SYNC_TIMEOUT_SECONDS", "300"))
 TTS_EVENT_QUEUE_SIZE = max(8, int(os.getenv("TTS_EVENT_QUEUE_SIZE", "32")))
+TTS_SOFT_INTERRUPT_TIMEOUT_SECONDS = max(
+    0.05,
+    float(os.getenv("TTS_SOFT_INTERRUPT_TIMEOUT_SECONDS", "0.35")),
+)
+TTS_HARD_INTERRUPT_TIMEOUT_SECONDS = max(
+    0.05,
+    float(os.getenv("TTS_HARD_INTERRUPT_TIMEOUT_SECONDS", "0.2")),
+)
 CHAT_PREFETCH_QUEUE_SIZE = max(8, int(os.getenv("CHAT_PREFETCH_QUEUE_SIZE", "128")))
 WORKER_JOIN_TIMEOUT_SECONDS = float(os.getenv("WORKER_JOIN_TIMEOUT_SECONDS", "2.0"))
 PERF_LOG = os.getenv("PERF_LOG", "1") != "0"
@@ -1877,6 +1886,7 @@ class TTSProcess:
         self.head_motion = head_motion
         self.lcd_display = lcd_display
         self.sync_events: "queue.Queue[str]" = queue.Queue(maxsize=TTS_EVENT_QUEUE_SIZE)
+        self.reset_events: "queue.Queue[str]" = queue.Queue(maxsize=TTS_EVENT_QUEUE_SIZE)
         self.display_events: "queue.Queue[tuple[str, str | bool] | None]" = queue.Queue(
             maxsize=TTS_EVENT_QUEUE_SIZE
         )
@@ -1885,15 +1895,21 @@ class TTSProcess:
         self.ready = threading.Event()
         self.send_lock = threading.Lock()
         self.worker = Path(__file__).with_name("tts_piper_stream_worker_19v2.py")
+        self.worker_temp_dir = Path(tempfile.mkdtemp(prefix="picarx_tts_v2_"))
         self.proc: subprocess.Popen[str] | None = None
         self.reader: threading.Thread | None = None
         self.closed = False
+        self.suspended = False
         self._start_worker()
         self.display_thread = threading.Thread(target=self._process_display_events, daemon=True)
         self.display_thread.start()
 
     def _start_worker(self) -> None:
         self.ready.clear()
+        self._cleanup_worker_temp_files()
+        self.worker_temp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        worker_env = os.environ.copy()
+        worker_env["TTS_TEMP_DIR"] = str(self.worker_temp_dir)
         self.proc = subprocess.Popen(
             [sys.executable, "-u", str(self.worker)],
             stdin=subprocess.PIPE,
@@ -1902,6 +1918,7 @@ class TTSProcess:
             text=True,
             bufsize=1,
             start_new_session=True,
+            env=worker_env,
         )
         self.reader = threading.Thread(target=self._read_output, args=(self.proc,), daemon=True)
         self.reader.start()
@@ -1932,6 +1949,25 @@ class TTSProcess:
                 self.sync_events.get_nowait()
             except queue.Empty:
                 return
+
+    def _drain_reset_events(self) -> None:
+        while True:
+            try:
+                self.reset_events.get_nowait()
+            except queue.Empty:
+                return
+
+    def _cleanup_worker_temp_files(self) -> None:
+        if not self.worker_temp_dir.exists():
+            return
+        for path in self.worker_temp_dir.iterdir():
+            try:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except OSError:
+                pass
 
     def _queue_display_event(self, event: str, value: str | bool) -> None:
         if not self.lcd_display or self.closed:
@@ -2004,14 +2040,28 @@ class TTSProcess:
                 except queue.Full:
                     self._drain_sync_events()
                     self.sync_events.put_nowait(sync_id)
+            if line.startswith("[TTS_RESET_DONE] "):
+                reset_id = line.split(" ", 1)[1]
+                try:
+                    self.reset_events.put_nowait(reset_id)
+                except queue.Full:
+                    self._drain_reset_events()
+                    self.reset_events.put_nowait(reset_id)
 
-    def send(self, msg: dict) -> None:
+    def send(self, msg: dict) -> bool:
+        is_speech = msg.get("command") in {"say", "beep"}
+        if is_speech and self.suspended:
+            return False
         if self.proc is None or self.proc.poll() is not None:
-            raise RuntimeError("TTS worker process exited")
+            if self.closed or not self.restart():
+                raise RuntimeError("TTS worker process exited")
         assert self.proc.stdin is not None
         with self.send_lock:
+            if is_speech and self.suspended:
+                return False
             self.proc.stdin.write(json.dumps(msg) + "\n")
             self.proc.stdin.flush()
+        return True
 
     def say(self, text: str, language: str | None = None, show_on_lcd: bool = True) -> None:
         text = normalize_for_spoken_tts(text)
@@ -2024,17 +2074,88 @@ class TTSProcess:
     def inter_sentence_beep(self) -> None:
         self.send({"command": "beep"})
 
-    def interrupt(self) -> None:
-        print("[TTS_INTERRUPT] stopping current speech", flush=True)
+    def restart(self) -> bool:
+        if self.closed:
+            return False
         with self.send_lock:
+            self.suspended = False
+            if self.proc is not None and self.proc.poll() is None:
+                return True
             old_reader = self.reader
-            self._terminate_worker()
             if old_reader and old_reader.is_alive() and old_reader is not threading.current_thread():
                 old_reader.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
             self._drain_sync_events()
+            self._drain_reset_events()
             self.pending_speech_line = ""
             self._start_worker()
+        return True
+
+    def _wait_for_reset(self, reset_id: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                event_id = self.reset_events.get(timeout=remaining)
+            except queue.Empty:
+                return False
+            if event_id == reset_id:
+                return True
+
+    def interrupt(self, restart: bool = True) -> None:
+        print("[TTS_INTERRUPT] stopping current speech", flush=True)
+        started = time.monotonic()
+        reset_id = str(time.monotonic_ns())
+        proc = self.proc
+        soft_interrupt_sent = False
+
+        with self.send_lock:
+            self.suspended = True
+            if proc is not None and proc.poll() is None and proc.stdin is not None:
+                try:
+                    os.kill(proc.pid, signal.SIGUSR1)
+                    proc.stdin.write(json.dumps({"command": "reset", "id": reset_id}) + "\n")
+                    proc.stdin.flush()
+                    soft_interrupt_sent = True
+                except (BrokenPipeError, OSError):
+                    soft_interrupt_sent = False
+
+        worker_preserved = soft_interrupt_sent and self._wait_for_reset(
+            reset_id,
+            TTS_SOFT_INTERRUPT_TIMEOUT_SECONDS,
+        )
+        if not worker_preserved:
+            with self.send_lock:
+                old_reader = self.reader
+                if proc is not None and self.proc is proc and proc.poll() is None:
+                    self._terminate_worker(timeout=TTS_HARD_INTERRUPT_TIMEOUT_SECONDS)
+                if old_reader and old_reader.is_alive() and old_reader is not threading.current_thread():
+                    old_reader.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
+                self.ready.clear()
+                self._cleanup_worker_temp_files()
+                self._drain_sync_events()
+                self._drain_reset_events()
+                self.pending_speech_line = ""
+                if restart and not self.closed:
+                    self._start_worker()
+            fallback_action = "worker restarted" if restart else "restart deferred"
+            print(f"[TTS_INTERRUPT_FALLBACK] worker stopped; {fallback_action}", flush=True)
+        else:
+            self._drain_sync_events()
+            self.pending_speech_line = ""
+            print("[TTS_INTERRUPT_FAST] playback stopped; voice model preserved", flush=True)
+
+        if restart:
+            with self.send_lock:
+                self.suspended = False
         self.last_done_at = time.monotonic()
+        if PERF_LOG:
+            print(
+                f"[PERF] tts_interrupt={self.last_done_at - started:.3f}s "
+                f"worker_preserved={int(worker_preserved)}",
+                flush=True,
+            )
         if self.head_motion:
             self.head_motion.stop()
         if self.lcd_display:
@@ -2106,6 +2227,8 @@ class TTSProcess:
                 self.display_thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
             if self.reader and self.reader.is_alive() and self.reader is not threading.current_thread():
                 self.reader.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
+            self._cleanup_worker_temp_files()
+            shutil.rmtree(self.worker_temp_dir, ignore_errors=True)
 
 
 class ThinkingCue:
@@ -2166,6 +2289,8 @@ class BargeInMonitor:
         self.followup_capture_started = threading.Event()
         self.followup_ready = threading.Event()
         self.followup_text = ""
+        self.last_handoff_seconds: float | None = None
+        self.last_followup_seconds: float | None = None
         self.thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -2180,6 +2305,8 @@ class BargeInMonitor:
         self.followup_capture_started.clear()
         self.followup_ready.clear()
         self.followup_text = ""
+        self.last_handoff_seconds = None
+        self.last_followup_seconds = None
         if not BARGE_IN_ENABLED:
             return
         self.thread = threading.Thread(target=self._run, name="barge-in-followup", daemon=True)
@@ -2202,9 +2329,10 @@ class BargeInMonitor:
             if not text:
                 continue
             if is_barge_in_request(text):
+                triggered_at = time.monotonic()
                 print(f"[BARGE_IN] Wake phrase heard during response: {text}", flush=True)
                 self.interrupt_event.set()
-                self.tts.interrupt()
+                self.tts.interrupt(restart=False)
                 self.lcd.send_display(
                     text="Now listening...",
                     meteor_shower=False,
@@ -2219,6 +2347,12 @@ class BargeInMonitor:
                 self.wake_listener.stop()
                 print("[BARGE_IN_FOLLOWUP] Listening for the new question.", flush=True)
                 try:
+                    self.last_handoff_seconds = time.monotonic() - triggered_at
+                    if PERF_LOG:
+                        print(
+                            f"[PERF] barge_handoff={self.last_handoff_seconds:.3f}s",
+                            flush=True,
+                        )
                     self.followup_capture_started.set()
                     self.followup_text = self.stt.listen(
                         max_wait_seconds=BARGE_IN_FOLLOWUP_START_TIMEOUT_SECONDS,
@@ -2232,6 +2366,12 @@ class BargeInMonitor:
                     if not self.capture_stop_event.is_set():
                         print(f"[BARGE_IN_FOLLOWUP_ERROR] {e}", flush=True)
                 finally:
+                    self.last_followup_seconds = time.monotonic() - triggered_at
+                    if PERF_LOG:
+                        print(
+                            f"[PERF] barge_followup={self.last_followup_seconds:.2f}s",
+                            flush=True,
+                        )
                     self.followup_ready.set()
                 return
             print(f"[BARGE_IN] Ignoring non-wake speech during response: {text}", flush=True)
@@ -2916,6 +3056,7 @@ def main():
         nonlocal pending_text, response_stream
         followup = barge_in.wait_for_followup()
         barge_in.stop()
+        tts.restart()
         response_stream = None
         if followup:
             pending_text = followup

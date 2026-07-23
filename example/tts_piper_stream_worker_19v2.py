@@ -27,30 +27,61 @@ EDGE_TTS_PITCH = os.getenv("EDGE_TTS_PITCH", "+0Hz")
 KOKORO_CHINESE_VOICE = os.getenv("KOKORO_CHINESE_VOICE", "zf_001")
 KOKORO_CHINESE_SPEED = float(os.getenv("KOKORO_CHINESE_SPEED", "1"))
 KOKORO_CHINESE_VARIANT = os.getenv("KOKORO_CHINESE_VARIANT", "v1.1-zh")
+TTS_TEMP_DIR = os.getenv("TTS_TEMP_DIR") or None
 
 kokoro_chinese_pipeline = None
 inter_sentence_beeps: list[str] = []
+active_play_proc: subprocess.Popen | None = None
+interruption_requested = False
+
+
+class SpeechInterrupted(Exception):
+    pass
 
 
 def handle_termination(signum, _frame) -> None:
     # Raising lets the active synthesis/playback cleanup blocks remove temp WAVs.
+    if active_play_proc is not None and active_play_proc.poll() is None:
+        active_play_proc.terminate()
     raise SystemExit(128 + signum)
 
 
-def play_wav(path: str) -> None:
-    last_error = None
-    for attempt in range(5):
-        try:
-            subprocess.run(
-                ["aplay", "-q", "-D", PLAYBACK_DEVICE, path],
-                check=True,
-            )
+def handle_soft_interrupt(_signum, _frame) -> None:
+    global interruption_requested
+    interruption_requested = True
+    if active_play_proc is not None and active_play_proc.poll() is None:
+        active_play_proc.terminate()
+
+
+def interruptible_sleep(seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while True:
+        if interruption_requested:
+            raise SpeechInterrupted
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return
-        except subprocess.CalledProcessError as e:
-            last_error = e
-            time.sleep(0.2 * (attempt + 1))
-    if last_error:
-        raise last_error
+        time.sleep(min(0.02, remaining))
+
+
+def play_wav(path: str) -> None:
+    global active_play_proc
+    args = ["aplay", "-q", "-D", PLAYBACK_DEVICE, path]
+    last_returncode = 1
+    for attempt in range(5):
+        if interruption_requested:
+            raise SpeechInterrupted
+        try:
+            active_play_proc = subprocess.Popen(args)
+            last_returncode = active_play_proc.wait()
+        finally:
+            active_play_proc = None
+        if interruption_requested:
+            raise SpeechInterrupted
+        if last_returncode == 0:
+            return
+        interruptible_sleep(0.2 * (attempt + 1))
+    raise subprocess.CalledProcessError(last_returncode, args)
 
 
 def generate_inter_sentence_beep() -> str:
@@ -60,7 +91,12 @@ def generate_inter_sentence_beep() -> str:
     wobble = random.uniform(4.0, 18.0)
     samples = int(sample_rate * duration)
 
-    with tempfile.NamedTemporaryFile(prefix="piper_gap_beep_", suffix=".wav", delete=False) as wav_file:
+    with tempfile.NamedTemporaryFile(
+        prefix="piper_gap_beep_",
+        suffix=".wav",
+        delete=False,
+        dir=TTS_TEMP_DIR,
+    ) as wav_file:
         wav_path = wav_file.name
 
     with wave.open(wav_path, "wb") as wav:
@@ -177,7 +213,12 @@ def synthesize_chinese_kokoro(text: str, wav_path: str) -> None:
 def synthesize_chinese_edge(text: str, wav_path: str) -> None:
     import edge_tts
 
-    with tempfile.NamedTemporaryFile(prefix="edge_tts_", suffix=".mp3", delete=False) as media:
+    with tempfile.NamedTemporaryFile(
+        prefix="edge_tts_",
+        suffix=".mp3",
+        delete=False,
+        dir=TTS_TEMP_DIR,
+    ) as media:
         media_path = media.name
     try:
         communicate = edge_tts.Communicate(
@@ -229,8 +270,10 @@ def synthesize_chinese(text: str, wav_path: str) -> None:
 
 
 def main() -> int:
+    global interruption_requested
     signal.signal(signal.SIGTERM, handle_termination)
     signal.signal(signal.SIGINT, handle_termination)
+    signal.signal(signal.SIGUSR1, handle_soft_interrupt)
     print(
         f"[TTS_INIT] Piper model={TTS_MODEL} playback={PLAYBACK_DEVICE} chinese_engine={CHINESE_TTS_ENGINE}",
         flush=True,
@@ -248,6 +291,15 @@ def main() -> int:
                 continue
 
             command = msg.get("command")
+            if command == "reset":
+                interruption_requested = False
+                print(f"[TTS_RESET_DONE] {msg.get('id', '')}", flush=True)
+                continue
+            if command == "quit":
+                return 0
+            if interruption_requested:
+                continue
+
             if command == "say":
                 text = normalize_for_tts(msg.get("text", ""))
                 language = normalize_language(str(msg.get("language", "")), text)
@@ -255,18 +307,29 @@ def main() -> int:
                 if text:
                     segments = split_chinese_tts_sentences(text) if language == "zh" else [text]
                     for segment in segments:
+                        if interruption_requested:
+                            break
                         event = "TTS_START" if display_text else "TTS_START_HIDDEN"
                         print(f"[{event}] lang={language} {segment}", flush=True)
                         wav_path = None
                         try:
-                            with tempfile.NamedTemporaryFile(prefix="piper_tts_", suffix=".wav", delete=False) as wav:
+                            with tempfile.NamedTemporaryFile(
+                                prefix="piper_tts_",
+                                suffix=".wav",
+                                delete=False,
+                                dir=TTS_TEMP_DIR,
+                            ) as wav:
                                 wav_path = wav.name
                             if language == "zh":
                                 synthesize_chinese(segment, wav_path)
                             else:
                                 tts.tts(segment, wav_path)
+                            if interruption_requested:
+                                raise SpeechInterrupted
                             print("[TTS_PLAY_START]", flush=True)
                             play_wav(wav_path)
+                        except SpeechInterrupted:
+                            break
                         except Exception as e:
                             print(f"[TTS_ERROR] {e}", flush=True)
                         finally:
@@ -275,17 +338,18 @@ def main() -> int:
                                     os.unlink(wav_path)
                                 except OSError:
                                     pass
-                    print("[TTS_DONE]", flush=True)
+                    if not interruption_requested:
+                        print("[TTS_DONE]", flush=True)
             elif command == "beep":
                 try:
                     print("[TTS_BEEP]", flush=True)
                     play_inter_sentence_beep()
+                except SpeechInterrupted:
+                    pass
                 except Exception as e:
                     print(f"[TTS_ERROR] beep failed: {e}", flush=True)
             elif command == "sync":
                 print(f"[TTS_SYNC_DONE] {msg.get('id', '')}", flush=True)
-            elif command == "quit":
-                return 0
         return 0
     finally:
         if kokoro_chinese_pipeline is not None:

@@ -34,6 +34,11 @@ BARGE_IN_INTERRUPT_POLL_SECONDS=0.03 ./run_19v2.sh
 Set `BARGE_IN_FOLLOWUP_ENABLED=0` to retain the older behavior, which only
 stops the response and returns to the normal listening loop.
 
+19v2 preserves the loaded Piper voice model when playback is interrupted. If
+the worker is still synthesizing and cannot stop promptly, it uses a bounded
+hard stop and waits until follow-up transcription is complete before reloading
+Piper. See [PERFORMANCE_19v2.md](PERFORMANCE_19v2.md) for measurements.
+
 ## Test
 
 ```bash

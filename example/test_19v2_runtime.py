@@ -2,6 +2,7 @@
 import importlib.util
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -87,9 +88,11 @@ class FakeFollowupSTT:
 class FakeTTS:
     def __init__(self):
         self.interrupt_calls = 0
+        self.interrupt_restarts = []
 
-    def interrupt(self):
+    def interrupt(self, restart=True):
         self.interrupt_calls += 1
+        self.interrupt_restarts.append(restart)
 
 
 class FakeLCD:
@@ -121,6 +124,25 @@ class FakeOllamaSession:
 
     def post(self, *_args, **_kwargs):
         return self.response
+
+
+class FakeWritableStdin:
+    def __init__(self):
+        self.lines = []
+
+    def write(self, line):
+        self.lines.append(line)
+
+    def flush(self):
+        pass
+
+
+class FakeRunningProcess:
+    def __init__(self):
+        self.stdin = FakeWritableStdin()
+
+    def poll(self):
+        return None
 
 
 class RuntimeTests(unittest.TestCase):
@@ -206,9 +228,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(monitor.interrupted())
         self.assertEqual(followup, "What is the tallest mountain?")
         self.assertEqual(tts.interrupt_calls, 1)
+        self.assertEqual(tts.interrupt_restarts, [False])
         self.assertGreaterEqual(wake_listener.stop_calls, 2)
         self.assertEqual(len(stt.calls), 1)
         self.assertTrue(monitor.followup_capture_started.is_set())
+        self.assertIsNotNone(monitor.last_handoff_seconds)
+        self.assertIsNotNone(monitor.last_followup_seconds)
         self.assertEqual(
             stt.calls[0]["max_wait_seconds"],
             VOICE_CHATBOT.BARGE_IN_FOLLOWUP_START_TIMEOUT_SECONDS,
@@ -256,6 +281,31 @@ class RuntimeTests(unittest.TestCase):
 
         self.assertTrue(response.closed)
         self.assertEqual(backend.messages, [{"role": "system", "content": "test"}])
+
+    def test_suspended_tts_drops_stale_speech_but_accepts_control_messages(self):
+        tts = VOICE_CHATBOT.TTSProcess.__new__(VOICE_CHATBOT.TTSProcess)
+        tts.proc = FakeRunningProcess()
+        tts.closed = False
+        tts.suspended = True
+        tts.send_lock = threading.Lock()
+
+        self.assertFalse(tts.send({"command": "say", "text": "stale"}))
+        self.assertEqual(tts.proc.stdin.lines, [])
+        self.assertTrue(tts.send({"command": "sync", "id": "control"}))
+        self.assertEqual(len(tts.proc.stdin.lines), 1)
+
+    def test_tts_owned_temp_directory_cleanup(self):
+        tts = VOICE_CHATBOT.TTSProcess.__new__(VOICE_CHATBOT.TTSProcess)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tts.worker_temp_dir = Path(temp_dir)
+            (tts.worker_temp_dir / "interrupted.wav").write_bytes(b"partial")
+            nested = tts.worker_temp_dir / "nested"
+            nested.mkdir()
+            (nested / "partial.mp3").write_bytes(b"partial")
+
+            tts._cleanup_worker_temp_files()
+
+            self.assertEqual(list(tts.worker_temp_dir.iterdir()), [])
 
     def test_terminate_process_reaps_child(self):
         proc = subprocess.Popen(
