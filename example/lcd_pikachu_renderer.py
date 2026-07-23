@@ -131,9 +131,14 @@ def _background_details(draw, mood, tick, width, height):
         draw.arc((18, 20, 78, 80), 65, 295, fill="#fff3bd", width=9)
         for x, y in ((408, 35), (435, 102), (52, 144)):
             _spark(draw, x, y, 5, "#ffffff", width=2)
-        drift = tick % 30
-        for index, (x, y, size) in enumerate(((66, 55, 18), (402, 80, 14), (424, 142, 10))):
-            _z_mark(draw, x + drift // 3, y - index * 3, size, "#665d91")
+        float_cycle = 56
+        z_colors = ("#8179aa", "#71699d", "#625a91")
+        for index, offset in enumerate((0, 14, 28, 42)):
+            progress = ((tick + offset) % float_cycle) / float_cycle
+            x = 398 + int(progress * 31) + int(math.sin((tick + offset) / 5.0) * 4)
+            y = 164 - int(progress * 126)
+            size = 9 + int(progress * 10)
+            _z_mark(draw, x, y, size, z_colors[min(2, int(progress * 3))])
     elif mood == "surprised":
         ray_color = "#b87618"
         pulse = int((math.sin(phase * 2.2) + 1) * 4)
