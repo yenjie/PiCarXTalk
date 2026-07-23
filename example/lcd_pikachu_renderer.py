@@ -136,18 +136,58 @@ def _draw_ears(draw, mood, tick, bob, listening):
     twitch_speed = 1.9 if mood == "excited" else 2.3 if listening else 6.5
     twitch = int(math.sin(tick / twitch_speed) * twitch_amount)
     if mood == "sleepy":
-        left = ((164, 98 + bob), (70 + twitch, 45 + bob), (184, 132 + bob))
-        right = ((316, 98 + bob), (410 - twitch, 45 + bob), (296, 132 + bob))
-        left_tip = ((70 + twitch, 45 + bob), (112 + twitch // 2, 58 + bob), (126, 82 + bob))
-        right_tip = ((410 - twitch, 45 + bob), (368 - twitch // 2, 58 + bob), (354, 82 + bob))
+        left = (
+            (164, 99 + bob),
+            (70 + twitch, 1 + bob),
+            (150 + twitch // 2, 52 + bob),
+            (205, 79 + bob),
+        )
+        right = (
+            (316, 99 + bob),
+            (410 - twitch, 1 + bob),
+            (330 - twitch // 2, 52 + bob),
+            (275, 79 + bob),
+        )
+        left_tip = (
+            (70 + twitch, 1 + bob),
+            (91 + twitch, 24 + bob),
+            (113 + twitch // 2, 30 + bob),
+        )
+        right_tip = (
+            (410 - twitch, 1 + bob),
+            (389 - twitch, 24 + bob),
+            (367 - twitch // 2, 30 + bob),
+        )
+    elif mood == "happy":
+        listen_lift = 7 if listening else 0
+        left = (
+            (160, 103 + bob),
+            (99 + twitch, 1 + bob - listen_lift),
+            (158 + twitch // 2, 49 + bob),
+            (205, 79 + bob),
+        )
+        right = (
+            (320, 103 + bob),
+            (381 - twitch, 1 + bob - listen_lift),
+            (322 - twitch // 2, 49 + bob),
+            (275, 79 + bob),
+        )
+        left_tip = (
+            (99 + twitch, 1 + bob - listen_lift),
+            (117 + twitch, 29 + bob),
+            (139 + twitch // 2, 35 + bob),
+        )
+        right_tip = (
+            (381 - twitch, 1 + bob - listen_lift),
+            (363 - twitch, 29 + bob),
+            (341 - twitch // 2, 35 + bob),
+        )
     else:
         listen_lift = 7 if listening else 0
         if mood == "surprised":
             left_top_x, right_top_x, ear_top_y = 75, 405, -2
         elif mood == "excited":
             left_top_x, right_top_x, ear_top_y = 98, 382, -24
-        elif mood == "happy":
-            left_top_x, right_top_x, ear_top_y = 96, 384, 0
         else:
             left_top_x, right_top_x, ear_top_y = 105, 375, -14
         left = (
