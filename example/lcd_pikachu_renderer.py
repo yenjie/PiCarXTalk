@@ -7,21 +7,44 @@ from PIL import Image, ImageDraw
 
 
 MOOD_BACKGROUNDS = {
-    "neutral": "#dff3f0",
-    "happy": "#aee9cd",
-    "excited": "#9de8f7",
-    "thinking": "#d9d3f2",
-    "sad": "#c9d9ec",
-    "angry": "#f2c5b8",
-    "sleepy": "#c9c6df",
-    "surprised": "#ffda8a",
-    "love": "#f2c8d8",
+    "neutral": "#cfeae5",
+    "happy": "#afe6cb",
+    "excited": "#9bdfee",
+    "thinking": "#d2caed",
+    "sad": "#bfd3e7",
+    "angry": "#edb7a7",
+    "sleepy": "#bebdda",
+    "surprised": "#f7cf78",
+    "love": "#edb8cc",
+}
+MOOD_HALOS = {
+    "neutral": "#e9f7f2",
+    "happy": "#e9fff1",
+    "excited": "#e5faff",
+    "thinking": "#eeeaff",
+    "sad": "#e4eef7",
+    "angry": "#ffe0d3",
+    "sleepy": "#deddf0",
+    "surprised": "#fff0bd",
+    "love": "#ffe4ee",
+}
+MOOD_ACCENTS = {
+    "neutral": "#5caa9b",
+    "happy": "#2ea98d",
+    "excited": "#168fb9",
+    "thinking": "#6a58a8",
+    "sad": "#678eb3",
+    "angry": "#bd4c3b",
+    "sleepy": "#655d94",
+    "surprised": "#bb7618",
+    "love": "#d55482",
 }
 VALID_MOODS = tuple(MOOD_BACKGROUNDS)
 INK = "#2b211d"
 YELLOW = "#ffd83d"
 YELLOW_LIGHT = "#ffe86b"
 CHEEK = "#ed4b3f"
+BROWN = "#8d552f"
 
 
 def _heart(draw, x, y, size, fill, outline=None, width=1):
@@ -47,8 +70,22 @@ def _z_mark(draw, x, y, size, fill):
     draw.line(points, fill=fill, width=max(3, size // 5), joint="curve")
 
 
+def _cloud(draw, x, y, fill, outline):
+    draw.ellipse((x, y + 8, x + 34, y + 34), fill=fill, outline=outline, width=2)
+    draw.ellipse((x + 20, y, x + 60, y + 34), fill=fill, outline=outline, width=2)
+    draw.ellipse((x + 46, y + 9, x + 76, y + 34), fill=fill, outline=outline, width=2)
+    draw.rounded_rectangle((x + 8, y + 18, x + 69, y + 38), radius=9, fill=fill)
+
+
 def _background_details(draw, mood, tick, width, height):
     phase = tick / 7.0
+    pulse = int((math.sin(phase * 0.7) + 1) * 3)
+    halo = MOOD_HALOS[mood]
+    accent = MOOD_ACCENTS[mood]
+    draw.ellipse((47 - pulse, -8 - pulse, 433 + pulse, 298 + pulse), fill=halo)
+    draw.ellipse((57 - pulse, 2 - pulse, 423 + pulse, 288 + pulse), outline=accent, width=3)
+    draw.ellipse((142, 274, 338, 312), fill="#b8a68f")
+
     if mood == "happy":
         colors = ("#ffffff", "#2ba98f", "#f47fa5")
         points = ((48, 48), (423, 47), (62, 138), (418, 151), (93, 226), (388, 224))
@@ -65,21 +102,35 @@ def _background_details(draw, mood, tick, width, height):
             draw.line((18, y, 18 + length, y - 8), fill="#258eb3", width=4)
             draw.line((462, y, 462 - length, y - 8), fill="#e36a8f", width=4)
     elif mood == "thinking":
-        for index, (x, y, color) in enumerate(
-            ((54, 64, "#6754a6"), (414, 42, "#d88b35"), (428, 142, "#478a9b"))
-        ):
-            offset = int(math.sin(phase + index * 1.7) * 5)
-            draw.rounded_rectangle((x - 8, y - 8 + offset, x + 8, y + 8 + offset), radius=3, fill=color)
+        orbit = ((54, 64, 9), (414, 42, 7), (428, 142, 11), (65, 190, 6))
+        colors = ("#6754a6", "#d88b35", "#478a9b", "#cf6e9f")
+        for index, (x, y, radius) in enumerate(orbit):
+            offset_x = int(math.sin(phase + index * 1.7) * 7)
+            offset_y = int(math.cos(phase * 0.8 + index) * 6)
+            draw.ellipse(
+                (x - radius + offset_x, y - radius + offset_y, x + radius + offset_x, y + radius + offset_y),
+                fill=colors[index],
+                outline="#ffffff",
+                width=2,
+            )
     elif mood == "sad":
+        _cloud(draw, 18, 24, "#dce9f3", "#718da9")
+        _cloud(draw, 385, 39, "#dce9f3", "#718da9")
         offset = tick % 22
-        for x, y in ((52, 42), (422, 72), (74, 150), (400, 170)):
+        for x, y in ((42, 75), (430, 92), (65, 165), (410, 184)):
             rain_y = (y + offset * 4) % (height - 60)
             draw.line((x, rain_y, x - 6, rain_y + 14), fill="#6f96bb", width=3)
     elif mood == "angry":
-        for x, y in ((44, 62), (428, 70), (58, 168), (415, 176)):
-            draw.line((x - 10, y - 7, x + 10, y + 7), fill="#bd4c3b", width=4)
-            draw.line((x - 10, y + 7, x + 10, y - 7), fill="#bd4c3b", width=4)
+        for index, (x, y) in enumerate(((44, 62), (436, 68), (54, 170), (425, 184))):
+            size = 11 + index % 2 * 4
+            draw.line((x - size, y - 8, x + size, y + 8), fill=accent, width=5)
+            draw.line((x - size, y + 8, x + size, y - 8), fill=accent, width=5)
+        draw.line((16, 116, 53, 108, 29, 92), fill="#dc745b", width=5, joint="curve")
+        draw.line((464, 116, 427, 108, 451, 92), fill="#dc745b", width=5, joint="curve")
     elif mood == "sleepy":
+        draw.arc((18, 20, 78, 80), 65, 295, fill="#fff3bd", width=9)
+        for x, y in ((408, 35), (435, 102), (52, 144)):
+            _spark(draw, x, y, 5, "#ffffff", width=2)
         drift = tick % 30
         for index, (x, y, size) in enumerate(((66, 55, 18), (402, 80, 14), (424, 142, 10))):
             _z_mark(draw, x + drift // 3, y - index * 3, size, "#665d91")
@@ -101,11 +152,14 @@ def _background_details(draw, mood, tick, width, height):
         draw.arc((411, 82, 457, 166), 75, 285, fill="#d59428", width=4)
     elif mood == "love":
         bob = int(math.sin(phase) * 4)
-        for x, y, size in ((55, 58, 11), (420, 52, 13), (65, 165, 8), (408, 165, 9)):
+        for x, y, size in ((50, 54, 12), (428, 48, 14), (62, 164, 9), (414, 169, 10)):
             _heart(draw, x, y + bob, size, "#dd668f")
+        draw.arc((20, 88, 80, 154), 210, 500, fill="#ffffff", width=3)
+        draw.arc((400, 88, 460, 154), 40, 330, fill="#ffffff", width=3)
     else:
-        draw.line((32, 42, 78, 42), fill="#67a89e", width=4)
-        draw.line((402, 42, 448, 42), fill="#67a89e", width=4)
+        for index, (x, y) in enumerate(((42, 42), (438, 48), (54, 150), (426, 172), (82, 230), (398, 228))):
+            radius = 4 + (index + tick // 8) % 3
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=accent)
 
 
 def _draw_tail(draw, mood, tick, bob, talking):
@@ -129,6 +183,11 @@ def _draw_tail(draw, mood, tick, bob, talking):
     )
     draw.line(points[:4], fill=INK, width=5, joint="curve")
     draw.line((391 + wag, 217 + bob, 417 + wag, 193 + bob), fill="#ffe45c", width=4)
+    draw.polygon(
+        ((350, 224 + bob), (374, 237 + bob), (363, 266 + bob), (350, 251 + bob)),
+        fill=BROWN,
+        outline=INK,
+    )
 
 
 def _draw_ears(draw, mood, tick, bob, listening):
@@ -138,23 +197,23 @@ def _draw_ears(draw, mood, tick, bob, listening):
     if mood == "sleepy":
         left = (
             (164, 99 + bob),
-            (70 + twitch, 1 + bob),
+            (70 + twitch, 12 + bob),
             (150 + twitch // 2, 52 + bob),
             (205, 79 + bob),
         )
         right = (
             (316, 99 + bob),
-            (410 - twitch, 1 + bob),
+            (410 - twitch, 12 + bob),
             (330 - twitch // 2, 52 + bob),
             (275, 79 + bob),
         )
         left_tip = (
-            (70 + twitch, 1 + bob),
+            (70 + twitch, 12 + bob),
             (91 + twitch, 24 + bob),
             (113 + twitch // 2, 30 + bob),
         )
         right_tip = (
-            (410 - twitch, 1 + bob),
+            (410 - twitch, 12 + bob),
             (389 - twitch, 24 + bob),
             (367 - twitch // 2, 30 + bob),
         )
@@ -162,53 +221,59 @@ def _draw_ears(draw, mood, tick, bob, listening):
         listen_lift = 7 if listening else 0
         left = (
             (160, 103 + bob),
-            (99 + twitch, 1 + bob - listen_lift),
+            (99 + twitch, 14 + bob - listen_lift),
             (158 + twitch // 2, 49 + bob),
             (205, 79 + bob),
         )
         right = (
             (320, 103 + bob),
-            (381 - twitch, 1 + bob - listen_lift),
+            (381 - twitch, 14 + bob - listen_lift),
             (322 - twitch // 2, 49 + bob),
             (275, 79 + bob),
         )
         left_tip = (
-            (99 + twitch, 1 + bob - listen_lift),
+            (99 + twitch, 14 + bob - listen_lift),
             (117 + twitch, 29 + bob),
             (139 + twitch // 2, 35 + bob),
         )
         right_tip = (
-            (381 - twitch, 1 + bob - listen_lift),
+            (381 - twitch, 14 + bob - listen_lift),
             (363 - twitch, 29 + bob),
             (341 - twitch // 2, 35 + bob),
         )
     else:
         listen_lift = 7 if listening else 0
-        if mood == "surprised":
-            left_top_x, right_top_x, ear_top_y = 75, 405, -2
-        elif mood == "excited":
-            left_top_x, right_top_x, ear_top_y = 98, 382, -24
-        else:
-            left_top_x, right_top_x, ear_top_y = 105, 375, -14
+        left_top_x, ear_top_y = {
+            "neutral": (99, 14),
+            "excited": (90, 18),
+            "thinking": (104, 14),
+            "sad": (82, 14),
+            "angry": (108, 14),
+            "surprised": (74, 16),
+            "love": (94, 14),
+        }.get(mood, (99, 14))
+        right_top_x = 480 - left_top_x
         left = (
-            (158, 103 + bob),
+            (160, 103 + bob),
             (left_top_x + twitch, ear_top_y + bob - listen_lift),
-            (208, 77 + bob),
+            (left_top_x + 59 + twitch // 2, ear_top_y + 48 + bob),
+            (205, 79 + bob),
         )
         right = (
-            (322, 103 + bob),
+            (320, 103 + bob),
             (right_top_x - twitch, ear_top_y + bob - listen_lift),
-            (272, 77 + bob),
+            (right_top_x - 59 - twitch // 2, ear_top_y + 48 + bob),
+            (275, 79 + bob),
         )
         left_tip = (
             (left_top_x + twitch, ear_top_y + bob - listen_lift),
-            (left_top_x + 25 + twitch // 2, 42 + bob),
-            (161, 35 + bob),
+            (left_top_x + 18 + twitch, ear_top_y + 28 + bob),
+            (left_top_x + 40 + twitch // 2, ear_top_y + 34 + bob),
         )
         right_tip = (
             (right_top_x - twitch, ear_top_y + bob - listen_lift),
-            (right_top_x - 25 - twitch // 2, 42 + bob),
-            (319, 35 + bob),
+            (right_top_x - 18 - twitch, ear_top_y + 28 + bob),
+            (right_top_x - 40 - twitch // 2, ear_top_y + 34 + bob),
         )
     draw.polygon(left, fill=YELLOW, outline=INK)
     draw.line(left + (left[0],), fill=INK, width=6, joint="curve")
@@ -274,6 +339,8 @@ def _draw_eyes(draw, mood, tick, bob, listening):
     elif mood == "angry":
         draw.polygon(((137, 103 + bob), (201, 115 + bob), (194, 151 + bob), (143, 143 + bob)), fill=INK)
         draw.polygon(((343, 103 + bob), (279, 115 + bob), (286, 151 + bob), (337, 143 + bob)), fill=INK)
+        draw.ellipse((158, 114 + bob, 171, 127 + bob), fill="#ffffff")
+        draw.ellipse((309, 114 + bob, 322, 127 + bob), fill="#ffffff")
         draw.line((132, 80 + bob, 202, 105 + bob), fill=INK, width=8)
         draw.line((278, 105 + bob, 348, 80 + bob), fill=INK, width=8)
     elif mood == "sleepy":
@@ -403,36 +470,31 @@ def render_pikachu(
     _draw_tail(draw, mood, tick, bob, talking)
     body_breathe = int((math.sin(tick / 9.0) + 1) * 2)
     draw.ellipse(
-        (126 - body_breathe, 222 + bob, 354 + body_breathe, 350 + bob),
+        (137 - body_breathe, 218 + bob, 343 + body_breathe, 357 + bob),
         fill="#f4c72f",
         outline=INK,
         width=6,
     )
-    draw.ellipse((111, 247 + bob, 177, 316 + bob), fill=YELLOW, outline=INK, width=5)
-    draw.ellipse((303, 247 + bob, 369, 316 + bob), fill=YELLOW, outline=INK, width=5)
-    draw.arc((119, 267 + bob, 170, 307 + bob), 200, 330, fill="#b48727", width=3)
-    draw.arc((310, 267 + bob, 361, 307 + bob), 210, 340, fill="#b48727", width=3)
+    draw.ellipse((166, 252 + bob, 314, 355 + bob), fill=YELLOW_LIGHT)
+    draw.ellipse((100, 278 + bob, 187, 330 + bob), fill=YELLOW, outline=INK, width=5)
+    draw.ellipse((293, 278 + bob, 380, 330 + bob), fill=YELLOW, outline=INK, width=5)
+    for x in (120, 146, 314, 340):
+        draw.arc((x, 291 + bob, x + 24, 319 + bob), 205, 325, fill="#a87528", width=3)
     _draw_ears(draw, mood, tick, bob, listening)
     draw.ellipse((72, 38 + bob, 408, 277 + bob), fill=YELLOW, outline=INK, width=7)
-    if mood != "happy":
-        draw.ellipse((99, 62 + bob, 381, 250 + bob), fill=YELLOW_LIGHT)
 
-    if mood == "happy":
-        cheek_pulse = 1 if tick % 10 < 5 else 0
-        left_cheek = (96, 159 + bob, 151, 207 + bob)
-        right_cheek = (329, 159 + bob, 384, 207 + bob)
-    elif mood == "excited":
-        cheek_pulse = 3 + (2 if tick % 6 < 3 else 0)
-        left_cheek = (87, 151 + bob, 158, 211 + bob)
-        right_cheek = (322, 151 + bob, 393, 211 + bob)
+    left_cheek = (96, 159 + bob, 151, 207 + bob)
+    right_cheek = (329, 159 + bob, 384, 207 + bob)
+    if mood == "excited":
+        cheek_pulse = 2 + (2 if tick % 6 < 3 else 0)
+    elif mood == "love":
+        cheek_pulse = 2 + (1 if tick % 10 < 5 else 0)
     elif mood == "surprised":
-        cheek_pulse = -4
-        left_cheek = (87, 151 + bob, 158, 211 + bob)
-        right_cheek = (322, 151 + bob, 393, 211 + bob)
+        cheek_pulse = -2
+    elif mood == "happy":
+        cheek_pulse = 1 if tick % 10 < 5 else 0
     else:
         cheek_pulse = 2 if talking and tick % 6 < 3 else 0
-        left_cheek = (87, 151 + bob, 158, 211 + bob)
-        right_cheek = (322, 151 + bob, 393, 211 + bob)
     draw.ellipse(
         (
             left_cheek[0] - cheek_pulse,
@@ -455,20 +517,21 @@ def render_pikachu(
         outline=INK,
         width=4,
     )
-    if mood != "happy":
-        draw.arc((100, 158 + bob, 143, 183 + bob), 205, 320, fill="#ff8c78", width=4)
-        draw.arc((337, 158 + bob, 380, 183 + bob), 220, 335, fill="#ff8c78", width=4)
     if mood == "excited":
         spark_shift = int(math.sin(tick / 2.0) * 7)
     else:
         spark_shift = int(math.sin(tick / 3.0) * 3) if talking else 0
-    if mood != "happy":
-        draw.line((94, 181 + bob, 70 - spark_shift, 168 + bob, 92, 157 + bob), fill="#f4bf25", width=4)
-        draw.line((386, 181 + bob, 410 + spark_shift, 168 + bob, 388, 157 + bob), fill="#f4bf25", width=4)
-
-    if mood != "happy":
-        draw.line((217, 56 + bob, 229, 70 + bob, 240, 54 + bob), fill="#d7a72b", width=3)
-        draw.line((240, 54 + bob, 252, 70 + bob, 264, 56 + bob), fill="#d7a72b", width=3)
+    if mood == "excited" or talking:
+        draw.line(
+            (96, 180 + bob, 72 - spark_shift, 168 + bob, 88, 151 + bob),
+            fill="#d69713",
+            width=4,
+        )
+        draw.line(
+            (384, 180 + bob, 408 + spark_shift, 168 + bob, 392, 151 + bob),
+            fill="#d69713",
+            width=4,
+        )
 
     _draw_eyes(draw, mood, tick, bob, listening)
     _draw_mouth(draw, mood, tick, bob, talking)
