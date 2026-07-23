@@ -206,6 +206,11 @@ WAKE_CANDIDATE_MAX_AGE_SECONDS = float(os.getenv("WAKE_CANDIDATE_MAX_AGE_SECONDS
 WAKE_RECORDER_RESTART_SECONDS = float(os.getenv("WAKE_RECORDER_RESTART_SECONDS", "1.0"))
 BARGE_IN_ENABLED = os.getenv("BARGE_IN_ENABLED", "1") != "0"
 BARGE_IN_LISTEN_TIMEOUT_SECONDS = float(os.getenv("BARGE_IN_LISTEN_TIMEOUT_SECONDS", "0.35"))
+BARGE_IN_PHRASES = tuple(
+    phrase.strip().lower()
+    for phrase in os.getenv("BARGE_IN_PHRASES", "hello robot,hey robot").split(",")
+    if phrase.strip()
+)
 TTS_MIN_CHARS = int(os.getenv("TTS_MIN_CHARS", "24"))
 TTS_EAGER_CHARS = int(os.getenv("TTS_EAGER_CHARS", "72"))
 STREAM_LOOP_SLEEP_SECONDS = float(os.getenv("STREAM_LOOP_SLEEP_SECONDS", "0"))
@@ -438,6 +443,15 @@ def is_wake_request(text: str) -> bool:
             print(f"[WAKE_FUZZY] matched greeting/robot words in '{normalized}'", flush=True)
             return True
     return False
+
+
+@functools.lru_cache(maxsize=1)
+def _normalized_barge_in_targets() -> frozenset[str]:
+    return frozenset(normalize_command_text(phrase) for phrase in BARGE_IN_PHRASES)
+
+
+def is_barge_in_request(text: str) -> bool:
+    return normalize_command_text(text) in _normalized_barge_in_targets()
 
 
 @functools.lru_cache(maxsize=1)
@@ -1898,7 +1912,7 @@ class BargeInMonitor:
                 return
             if not text:
                 continue
-            if is_wake_request(text):
+            if is_barge_in_request(text):
                 print(f"[BARGE_IN] Wake phrase heard during response: {text}", flush=True)
                 self.interrupt_event.set()
                 self.tts.interrupt()

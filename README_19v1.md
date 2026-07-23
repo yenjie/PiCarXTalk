@@ -49,3 +49,5 @@ TTS_PLAYBACK_DEVICE=pulse ./run_19v1.sh
 ```
 
 Useful environment settings include `CODEX_MODEL`, `OLLAMA_MODEL`, `MIC_ALSA_DEVICE`, `LCD_SCREEN`, `LCD_PYTHON_DIR`, `TTS_PLAYBACK_DEVICE`, `WHISPER_MODEL`, `THINKING_FILLERS_EN`, and `THINKING_FILLERS_ZH`.
+
+While the robot is responding, interruption is intentionally stricter than wake-from-sleep recognition. By default, only exact `hello robot` or `hey robot` interrupts a response. Set `BARGE_IN_PHRASES` to customize that list; permissive wake aliases remain available while sleeping.
