@@ -146,6 +146,8 @@ def _draw_ears(draw, mood, tick, bob, listening):
             left_top_x, right_top_x, ear_top_y = 75, 405, -2
         elif mood == "excited":
             left_top_x, right_top_x, ear_top_y = 98, 382, -24
+        elif mood == "happy":
+            left_top_x, right_top_x, ear_top_y = 96, 384, 0
         else:
             left_top_x, right_top_x, ear_top_y = 105, 375, -14
         left = (
@@ -204,10 +206,8 @@ def _draw_eyes(draw, mood, tick, bob, listening):
     listening_look = int(math.sin(tick / 7.0) * 6) if listening else 0
     if mood == "happy":
         eye_lift = int((math.sin(tick / 5.0) + 1) * 2)
-        draw.arc((126, y - 30 - eye_lift, 214, y + 30), 195, 345, fill=INK, width=10)
-        draw.arc((266, y - 30 - eye_lift, 354, y + 30), 195, 345, fill=INK, width=10)
-        draw.line((132, y - 8, 119, y - 18), fill=INK, width=5)
-        draw.line((348, y - 8, 361, y - 18), fill=INK, width=5)
+        draw.arc((137, y - 24 - eye_lift, 203, y + 23), 195, 345, fill=INK, width=9)
+        draw.arc((277, y - 24 - eye_lift, 343, y + 23), 195, 345, fill=INK, width=9)
     elif mood == "excited":
         _normal_eye(draw, left_x, y, wide=True)
         _normal_eye(draw, right_x, y, wide=True)
@@ -237,8 +237,8 @@ def _draw_eyes(draw, mood, tick, bob, listening):
         draw.line((132, 80 + bob, 202, 105 + bob), fill=INK, width=8)
         draw.line((278, 105 + bob, 348, 80 + bob), fill=INK, width=8)
     elif mood == "sleepy":
-        draw.arc((134, 103 + bob, 202, 151 + bob), 195, 345, fill=INK, width=8)
-        draw.arc((278, 103 + bob, 346, 151 + bob), 195, 345, fill=INK, width=8)
+        draw.arc((134, 103 + bob, 202, 151 + bob), 15, 165, fill=INK, width=8)
+        draw.arc((278, 103 + bob, 346, 151 + bob), 15, 165, fill=INK, width=8)
     elif mood == "surprised":
         _surprised_eye(draw, left_x, y)
         _surprised_eye(draw, right_x, y)
@@ -278,10 +278,10 @@ def _draw_mouth(draw, mood, tick, bob, talking):
         )
         return
     if mood == "happy":
-        draw.arc((188, y - 17, 240, y + 33), 5, 155, fill=INK, width=7)
-        draw.arc((240, y - 17, 292, y + 33), 25, 175, fill=INK, width=7)
-        draw.ellipse((201, y + 10, 279, y + 47), fill="#6b302d", outline=INK, width=4)
-        draw.arc((214, y + 28, 266, y + 51), 180, 360, fill="#f27b8e", width=9)
+        draw.arc((204, y - 13, 240, y + 23), 5, 155, fill=INK, width=6)
+        draw.arc((240, y - 13, 276, y + 23), 25, 175, fill=INK, width=6)
+        draw.ellipse((215, y + 8, 265, y + 45), fill="#68322e", outline=INK, width=4)
+        draw.arc((224, y + 27, 256, y + 47), 180, 360, fill="#ef7889", width=8)
     elif mood == "love":
         draw.arc((193, y - 14, 240, y + 35), 5, 155, fill=INK, width=6)
         draw.arc((240, y - 14, 287, y + 35), 25, 175, fill=INK, width=6)
@@ -374,39 +374,61 @@ def render_pikachu(
     draw.arc((310, 267 + bob, 361, 307 + bob), 210, 340, fill="#b48727", width=3)
     _draw_ears(draw, mood, tick, bob, listening)
     draw.ellipse((72, 38 + bob, 408, 277 + bob), fill=YELLOW, outline=INK, width=7)
-    draw.ellipse((99, 62 + bob, 381, 250 + bob), fill=YELLOW_LIGHT)
+    if mood != "happy":
+        draw.ellipse((99, 62 + bob, 381, 250 + bob), fill=YELLOW_LIGHT)
 
-    if mood == "excited":
+    if mood == "happy":
+        cheek_pulse = 1 if tick % 10 < 5 else 0
+        left_cheek = (96, 159 + bob, 151, 207 + bob)
+        right_cheek = (329, 159 + bob, 384, 207 + bob)
+    elif mood == "excited":
         cheek_pulse = 3 + (2 if tick % 6 < 3 else 0)
-    elif mood == "happy":
-        cheek_pulse = 1 + (1 if tick % 10 < 5 else 0)
+        left_cheek = (87, 151 + bob, 158, 211 + bob)
+        right_cheek = (322, 151 + bob, 393, 211 + bob)
     elif mood == "surprised":
         cheek_pulse = -4
+        left_cheek = (87, 151 + bob, 158, 211 + bob)
+        right_cheek = (322, 151 + bob, 393, 211 + bob)
     else:
         cheek_pulse = 2 if talking and tick % 6 < 3 else 0
+        left_cheek = (87, 151 + bob, 158, 211 + bob)
+        right_cheek = (322, 151 + bob, 393, 211 + bob)
     draw.ellipse(
-        (87 - cheek_pulse, 151 - cheek_pulse + bob, 158 + cheek_pulse, 211 + cheek_pulse + bob),
+        (
+            left_cheek[0] - cheek_pulse,
+            left_cheek[1] - cheek_pulse,
+            left_cheek[2] + cheek_pulse,
+            left_cheek[3] + cheek_pulse,
+        ),
         fill=CHEEK,
         outline=INK,
         width=4,
     )
     draw.ellipse(
-        (322 - cheek_pulse, 151 - cheek_pulse + bob, 393 + cheek_pulse, 211 + cheek_pulse + bob),
+        (
+            right_cheek[0] - cheek_pulse,
+            right_cheek[1] - cheek_pulse,
+            right_cheek[2] + cheek_pulse,
+            right_cheek[3] + cheek_pulse,
+        ),
         fill=CHEEK,
         outline=INK,
         width=4,
     )
-    draw.arc((100, 158 + bob, 143, 183 + bob), 205, 320, fill="#ff8c78", width=4)
-    draw.arc((337, 158 + bob, 380, 183 + bob), 220, 335, fill="#ff8c78", width=4)
+    if mood != "happy":
+        draw.arc((100, 158 + bob, 143, 183 + bob), 205, 320, fill="#ff8c78", width=4)
+        draw.arc((337, 158 + bob, 380, 183 + bob), 220, 335, fill="#ff8c78", width=4)
     if mood == "excited":
         spark_shift = int(math.sin(tick / 2.0) * 7)
     else:
         spark_shift = int(math.sin(tick / 3.0) * 3) if talking else 0
-    draw.line((94, 181 + bob, 70 - spark_shift, 168 + bob, 92, 157 + bob), fill="#f4bf25", width=4)
-    draw.line((386, 181 + bob, 410 + spark_shift, 168 + bob, 388, 157 + bob), fill="#f4bf25", width=4)
+    if mood != "happy":
+        draw.line((94, 181 + bob, 70 - spark_shift, 168 + bob, 92, 157 + bob), fill="#f4bf25", width=4)
+        draw.line((386, 181 + bob, 410 + spark_shift, 168 + bob, 388, 157 + bob), fill="#f4bf25", width=4)
 
-    draw.line((217, 56 + bob, 229, 70 + bob, 240, 54 + bob), fill="#d7a72b", width=3)
-    draw.line((240, 54 + bob, 252, 70 + bob, 264, 56 + bob), fill="#d7a72b", width=3)
+    if mood != "happy":
+        draw.line((217, 56 + bob, 229, 70 + bob, 240, 54 + bob), fill="#d7a72b", width=3)
+        draw.line((240, 54 + bob, 252, 70 + bob, 264, 56 + bob), fill="#d7a72b", width=3)
 
     _draw_eyes(draw, mood, tick, bob, listening)
     _draw_mouth(draw, mood, tick, bob, talking)
