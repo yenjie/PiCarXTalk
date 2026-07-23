@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PIL renderer for the enhanced Pikachu LCD face used by 19k."""
+"""Lightweight state-driven Pikachu renderer for the talking-robot LCD."""
 
 import math
 
@@ -85,28 +85,50 @@ def _background_details(draw, mood, tick, width, height):
         draw.line((402, 42, 448, 42), fill="#67a89e", width=4)
 
 
-def _draw_tail(draw, mood, bob):
+def _draw_tail(draw, mood, tick, bob, talking):
     tail_fill = "#edbf2f" if mood != "angry" else "#e9a62d"
+    wag_size = 10 if talking or mood == "excited" else 5
+    wag_speed = 2.2 if talking else 5.5
+    wag = int(math.sin(tick / wag_speed) * wag_size)
+    points = (
+        (350, 205 + bob),
+        (432 + wag, 147 + bob),
+        (405 + wag, 206 + bob),
+        (455 + wag, 205 + bob),
+        (371, 291 + bob),
+        (398, 232 + bob),
+        (350, 250 + bob),
+    )
     draw.polygon(
-        ((350, 205 + bob), (432, 147 + bob), (405, 206 + bob), (455, 205 + bob),
-         (371, 291 + bob), (398, 232 + bob), (350, 250 + bob)),
+        points,
         fill=tail_fill,
         outline=INK,
     )
-    draw.line((350, 205 + bob, 432, 147 + bob, 405, 206 + bob, 455, 205 + bob), fill=INK, width=5)
+    draw.line(points[:4], fill=INK, width=5, joint="curve")
+    draw.line((391 + wag, 217 + bob, 417 + wag, 193 + bob), fill="#ffe45c", width=4)
 
 
-def _draw_ears(draw, mood, bob):
+def _draw_ears(draw, mood, tick, bob, listening):
+    twitch = int(math.sin(tick / (2.3 if listening else 6.5)) * (7 if listening else 3))
     if mood == "sleepy":
-        left = ((164, 98 + bob), (70, 45 + bob), (184, 132 + bob))
-        right = ((316, 98 + bob), (410, 45 + bob), (296, 132 + bob))
-        left_tip = ((70, 45 + bob), (112, 58 + bob), (126, 82 + bob))
-        right_tip = ((410, 45 + bob), (368, 58 + bob), (354, 82 + bob))
+        left = ((164, 98 + bob), (70 + twitch, 45 + bob), (184, 132 + bob))
+        right = ((316, 98 + bob), (410 - twitch, 45 + bob), (296, 132 + bob))
+        left_tip = ((70 + twitch, 45 + bob), (112 + twitch // 2, 58 + bob), (126, 82 + bob))
+        right_tip = ((410 - twitch, 45 + bob), (368 - twitch // 2, 58 + bob), (354, 82 + bob))
     else:
-        left = ((158, 103 + bob), (105, -14 + bob), (208, 77 + bob))
-        right = ((322, 103 + bob), (375, -14 + bob), (272, 77 + bob))
-        left_tip = ((105, -14 + bob), (130, 42 + bob), (161, 35 + bob))
-        right_tip = ((375, -14 + bob), (350, 42 + bob), (319, 35 + bob))
+        listen_lift = 7 if listening else 0
+        left = ((158, 103 + bob), (105 + twitch, -14 + bob - listen_lift), (208, 77 + bob))
+        right = ((322, 103 + bob), (375 - twitch, -14 + bob - listen_lift), (272, 77 + bob))
+        left_tip = (
+            (105 + twitch, -14 + bob - listen_lift),
+            (130 + twitch // 2, 42 + bob),
+            (161, 35 + bob),
+        )
+        right_tip = (
+            (375 - twitch, -14 + bob - listen_lift),
+            (350 - twitch // 2, 42 + bob),
+            (319, 35 + bob),
+        )
     draw.polygon(left, fill=YELLOW, outline=INK)
     draw.line(left + (left[0],), fill=INK, width=6, joint="curve")
     draw.polygon(right, fill=YELLOW, outline=INK)
@@ -119,15 +141,24 @@ def _normal_eye(draw, x, y, look=0, wide=False):
     radius_x = 28 if wide else 24
     radius_y = 34 if wide else 30
     draw.ellipse((x - radius_x, y - radius_y, x + radius_x, y + radius_y), fill=INK)
+    draw.ellipse((x - 14 + look, y + 3, x + 15 + look, y + 25), fill="#6f493b")
     draw.ellipse((x - 10 + look, y - 18, x + 5 + look, y - 3), fill="#ffffff")
+    draw.ellipse((x - 5 + look, y - 13, x + 1 + look, y - 7), fill="#dff8ff")
     draw.ellipse((x + 8 + look, y + 10, x + 14 + look, y + 16), fill="#8b5e45")
 
 
-def _draw_eyes(draw, mood, tick, bob):
+def _draw_eyes(draw, mood, tick, bob, listening):
     left_x, right_x, y = 170, 310, 126 + bob
+    blink = tick > 8 and tick % 73 in {55, 56}
+    if blink and mood not in {"angry", "sleepy", "love"}:
+        curve = 8 if mood in {"happy", "excited"} else 4
+        draw.arc((136, y - curve, 204, y + 28), 195, 345, fill=INK, width=8)
+        draw.arc((276, y - curve, 344, y + 28), 195, 345, fill=INK, width=8)
+        return
+    listening_look = int(math.sin(tick / 7.0) * 6) if listening else 0
     if mood == "happy":
-        _normal_eye(draw, left_x, y, wide=True)
-        _normal_eye(draw, right_x, y, wide=True)
+        _normal_eye(draw, left_x, y, look=listening_look, wide=True)
+        _normal_eye(draw, right_x, y, look=listening_look, wide=True)
         _spark(draw, left_x + 4, y - 2, 9, "#ffffff", width=3)
         _spark(draw, right_x + 4, y - 2, 9, "#ffffff", width=3)
     elif mood == "excited":
@@ -165,13 +196,19 @@ def _draw_eyes(draw, mood, tick, bob):
         _heart(draw, left_x, y, 24, "#cf3e6e", outline=INK, width=2)
         _heart(draw, right_x, y, 24, "#cf3e6e", outline=INK, width=2)
     else:
-        _normal_eye(draw, left_x, y)
-        _normal_eye(draw, right_x, y)
+        _normal_eye(draw, left_x, y, look=listening_look)
+        _normal_eye(draw, right_x, y, look=listening_look)
 
 
-def _draw_mouth(draw, mood, bob):
+def _draw_mouth(draw, mood, tick, bob, talking):
     y = 174 + bob
     draw.polygon(((236, 155 + bob), (244, 155 + bob), (240, 162 + bob)), fill=INK)
+    if talking and mood != "sleepy":
+        open_height = 30 + int((math.sin(tick * 1.35) + 1) * 10)
+        draw.ellipse((213, y + 1, 267, y + open_height), fill="#542823", outline=INK, width=5)
+        tongue_top = y + max(18, open_height - 11)
+        draw.arc((222, tongue_top - 6, 258, tongue_top + 14), 180, 360, fill="#ef7487", width=8)
+        return
     if mood in {"happy", "love"}:
         draw.arc((193, y - 14, 240, y + 35), 5, 155, fill=INK, width=6)
         draw.arc((240, y - 14, 287, y + 35), 25, 175, fill=INK, width=6)
@@ -194,7 +231,14 @@ def _draw_mouth(draw, mood, bob):
         draw.arc((240, y - 1, 269, y + 31), 25, 175, fill=INK, width=5)
 
 
-def render_pikachu(size=(480, 320), expression="neutral", tick=0):
+def render_pikachu(
+    size=(480, 320),
+    expression="neutral",
+    tick=0,
+    *,
+    talking=False,
+    listening=False,
+):
     """Render one animated Pikachu mood frame at the requested logical size."""
     mood = str(expression or "neutral").strip().lower()
     if mood not in VALID_MOODS:
@@ -205,25 +249,54 @@ def render_pikachu(size=(480, 320), expression="neutral", tick=0):
     draw = ImageDraw.Draw(image)
     _background_details(draw, mood, tick, width, height)
 
-    bob = 0
+    bob = int(round(math.sin(tick / 8.0) * 1.5))
     if mood == "excited":
         bob = -2 - int(abs(math.sin(tick / 3.0)) * 4)
     elif mood == "sleepy":
         bob = int((math.sin(tick / 8.0) + 1) * 2)
+    elif talking:
+        bob += int(round(math.sin(tick / 2.7) * 2))
 
-    _draw_tail(draw, mood, bob)
-    draw.ellipse((126, 222 + bob, 354, 350 + bob), fill="#f4c72f", outline=INK, width=6)
-    _draw_ears(draw, mood, bob)
+    _draw_tail(draw, mood, tick, bob, talking)
+    body_breathe = int((math.sin(tick / 9.0) + 1) * 2)
+    draw.ellipse(
+        (126 - body_breathe, 222 + bob, 354 + body_breathe, 350 + bob),
+        fill="#f4c72f",
+        outline=INK,
+        width=6,
+    )
+    draw.ellipse((111, 247 + bob, 177, 316 + bob), fill=YELLOW, outline=INK, width=5)
+    draw.ellipse((303, 247 + bob, 369, 316 + bob), fill=YELLOW, outline=INK, width=5)
+    draw.arc((119, 267 + bob, 170, 307 + bob), 200, 330, fill="#b48727", width=3)
+    draw.arc((310, 267 + bob, 361, 307 + bob), 210, 340, fill="#b48727", width=3)
+    _draw_ears(draw, mood, tick, bob, listening)
     draw.ellipse((72, 38 + bob, 408, 277 + bob), fill=YELLOW, outline=INK, width=7)
     draw.ellipse((99, 62 + bob, 381, 250 + bob), fill=YELLOW_LIGHT)
 
-    draw.ellipse((87, 151 + bob, 158, 211 + bob), fill=CHEEK, outline=INK, width=4)
-    draw.ellipse((322, 151 + bob, 393, 211 + bob), fill=CHEEK, outline=INK, width=4)
-    draw.line((94, 181 + bob, 70, 168 + bob, 92, 157 + bob), fill="#f4bf25", width=4)
-    draw.line((386, 181 + bob, 410, 168 + bob, 388, 157 + bob), fill="#f4bf25", width=4)
+    cheek_pulse = 2 if talking and tick % 6 < 3 else 0
+    draw.ellipse(
+        (87 - cheek_pulse, 151 - cheek_pulse + bob, 158 + cheek_pulse, 211 + cheek_pulse + bob),
+        fill=CHEEK,
+        outline=INK,
+        width=4,
+    )
+    draw.ellipse(
+        (322 - cheek_pulse, 151 - cheek_pulse + bob, 393 + cheek_pulse, 211 + cheek_pulse + bob),
+        fill=CHEEK,
+        outline=INK,
+        width=4,
+    )
+    draw.arc((100, 158 + bob, 143, 183 + bob), 205, 320, fill="#ff8c78", width=4)
+    draw.arc((337, 158 + bob, 380, 183 + bob), 220, 335, fill="#ff8c78", width=4)
+    spark_shift = int(math.sin(tick / 3.0) * 3) if talking else 0
+    draw.line((94, 181 + bob, 70 - spark_shift, 168 + bob, 92, 157 + bob), fill="#f4bf25", width=4)
+    draw.line((386, 181 + bob, 410 + spark_shift, 168 + bob, 388, 157 + bob), fill="#f4bf25", width=4)
 
-    _draw_eyes(draw, mood, tick, bob)
-    _draw_mouth(draw, mood, bob)
+    draw.line((217, 56 + bob, 229, 70 + bob, 240, 54 + bob), fill="#d7a72b", width=3)
+    draw.line((240, 54 + bob, 252, 70 + bob, 264, 56 + bob), fill="#d7a72b", width=3)
+
+    _draw_eyes(draw, mood, tick, bob, listening)
+    _draw_mouth(draw, mood, tick, bob, talking)
 
     if size != image.size:
         image = image.resize(size, Image.Resampling.LANCZOS)

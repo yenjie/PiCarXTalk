@@ -39,6 +39,7 @@ TEXT_FONT_SIZE = int(os.getenv("LCD_TEXT_FONT_SIZE", "16"))
 TEXT_MAX_LINES = int(os.getenv("LCD_TEXT_MAX_LINES", "3"))
 TEXT_BOX_ALPHA = int(os.getenv("LCD_TEXT_BOX_ALPHA", "150"))
 TEXT_BOX_OUTLINE_ALPHA = int(os.getenv("LCD_TEXT_BOX_OUTLINE_ALPHA", "180"))
+DISPLAY_COMMAND_QUEUE_SIZE = max(4, int(os.getenv("LCD_COMMAND_QUEUE_SIZE", "32")))
 SUPPRESS_LCD_LIBRARY_STATUS = os.getenv("SUPPRESS_LCD_LIBRARY_STATUS", "1") != "0"
 
 
@@ -179,48 +180,57 @@ def wrap_text(draw, text, fonts, max_width):
         return []
     lines = []
     current = ""
+    current_width = 0
     for char in compact_text:
-        candidate = f"{current}{char}" if current else char
-        if text_width(draw, candidate, fonts) <= max_width:
-            current = candidate
+        char_width = text_width(draw, char, fonts)
+        if not current or current_width + char_width <= max_width:
+            current += char
+            current_width += char_width
             continue
-        if current:
-            lines.append(current)
+        lines.append(current)
         current = char
+        current_width = char_width
     if current:
         lines.append(current)
     return lines[-TEXT_MAX_LINES:]
 
 
-def draw_response_text(image, text, fonts):
+def draw_response_text(image, text, fonts, cache=None):
     text = " ".join(str(text or "").split())
     if not text:
+        if cache is not None:
+            cache.update(key=None, overlay=None)
         return image
 
     image = image.convert("RGBA")
-    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    margin = 14
-    line_gap = 3
-    max_width = image.width - margin * 2
-    lines = wrap_text(draw, text, fonts, max_width)
-    if not lines:
-        return image.convert("RGB")
+    cache_key = (image.size, text)
+    overlay = cache.get("overlay") if cache is not None and cache.get("key") == cache_key else None
+    if overlay is None:
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        margin = 14
+        line_gap = 3
+        max_width = image.width - margin * 2
+        lines = wrap_text(draw, text, fonts, max_width)
+        if not lines:
+            return image.convert("RGB")
 
-    line_height = max(text_height(line, fonts) for line in lines)
-    box_height = margin + len(lines) * line_height + (len(lines) - 1) * line_gap
-    top = image.height - box_height - 10
-    draw.rounded_rectangle(
-        (8, top, image.width - 8, image.height - 8),
-        radius=10,
-        fill=(255, 248, 218, max(0, min(255, TEXT_BOX_ALPHA))),
-        outline=(59, 43, 37, max(0, min(255, TEXT_BOX_OUTLINE_ALPHA))),
-        width=2,
-    )
-    y = top + margin // 2
-    for line in lines:
-        draw_mixed_text(draw, (margin, y), line, fonts, fill=(43, 33, 29, 255))
-        y += line_height + line_gap
+        line_height = max(text_height(line, fonts) for line in lines)
+        box_height = margin + len(lines) * line_height + (len(lines) - 1) * line_gap
+        top = image.height - box_height - 10
+        draw.rounded_rectangle(
+            (8, top, image.width - 8, image.height - 8),
+            radius=10,
+            fill=(255, 248, 218, max(0, min(255, TEXT_BOX_ALPHA))),
+            outline=(59, 43, 37, max(0, min(255, TEXT_BOX_OUTLINE_ALPHA))),
+            width=2,
+        )
+        y = top + margin // 2
+        for line in lines:
+            draw_mixed_text(draw, (margin, y), line, fonts, fill=(43, 33, 29, 255))
+            y += line_height + line_gap
+        if cache is not None:
+            cache.update(key=cache_key, overlay=overlay)
     return Image.alpha_composite(image, overlay).convert("RGB")
 
 
@@ -340,6 +350,23 @@ def draw_idea_icon(image, tick):
     return Image.alpha_composite(image, overlay).convert("RGB")
 
 
+def queue_display_command(command_queue, command):
+    try:
+        command_queue.put_nowait(command)
+        return
+    except queue.Full:
+        pass
+    merged = {}
+    while True:
+        try:
+            queued = command_queue.get_nowait()
+        except queue.Empty:
+            break
+        merged.update({key: value for key, value in queued.items() if value is not None})
+    merged.update({key: value for key, value in command.items() if value is not None})
+    command_queue.put_nowait(merged)
+
+
 def read_display_commands(command_queue):
     for line in sys.stdin:
         raw = line.strip()
@@ -374,7 +401,7 @@ def read_display_commands(command_queue):
                 command["collection"] = raw
             else:
                 command["expression"] = raw
-        command_queue.put(command)
+        queue_display_command(command_queue, command)
 
 
 def parse_args():
@@ -437,8 +464,9 @@ def main():
     listening_waves_state = {"enabled": False, "tick": 0}
     idea_icon_state = {"enabled": False, "tick": 0}
     animation_state = {"tick": 0}
-    command_queue = queue.Queue()
+    command_queue = queue.Queue(maxsize=DISPLAY_COMMAND_QUEUE_SIZE)
     text_fonts = load_text_fonts()
+    text_overlay_cache = {"key": None, "overlay": None}
     threading.Thread(target=read_display_commands, args=(command_queue,), daemon=True).start()
 
     print("Face commands: type 1, 2, 3, stack, pika, wall-e, or an expression name, then press Enter.", flush=True)
@@ -507,6 +535,8 @@ def main():
                     (window.WIDTH, window.HEIGHT),
                     face.expression_name,
                     animation_state["tick"],
+                    talking=meteor_shower_state["enabled"],
+                    listening=listening_waves_state["enabled"],
                 )
             else:
                 image = canvas_to_image(face, window.WIDTH, window.HEIGHT)
@@ -523,7 +553,7 @@ def main():
             if idea_icon_state["enabled"]:
                 image = draw_idea_icon(image, idea_icon_state["tick"])
                 idea_icon_state["tick"] += 1
-            image = draw_response_text(image, text_state["value"], text_fonts)
+            image = draw_response_text(image, text_state["value"], text_fonts, text_overlay_cache)
             frame = render_for_lcd(image, target_size, args.mode)
             if SUPPRESS_LCD_LIBRARY_STATUS:
                 with contextlib.redirect_stdout(io.StringIO()):

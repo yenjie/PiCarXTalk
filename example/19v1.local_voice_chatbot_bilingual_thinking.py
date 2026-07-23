@@ -245,6 +245,9 @@ HEAD_MOVE_MAX_SECONDS = float(os.getenv("HEAD_MOVE_MAX_SECONDS", "1.8"))
 HEAD_CENTER_ON_STARTUP = os.getenv("HEAD_CENTER_ON_STARTUP", "0") != "0"
 HEAD_LAZY_INIT = os.getenv("HEAD_LAZY_INIT", "1") != "0"
 TTS_SYNC_TIMEOUT_SECONDS = float(os.getenv("TTS_SYNC_TIMEOUT_SECONDS", "300"))
+TTS_EVENT_QUEUE_SIZE = max(8, int(os.getenv("TTS_EVENT_QUEUE_SIZE", "32")))
+CHAT_PREFETCH_QUEUE_SIZE = max(8, int(os.getenv("CHAT_PREFETCH_QUEUE_SIZE", "128")))
+WORKER_JOIN_TIMEOUT_SECONDS = float(os.getenv("WORKER_JOIN_TIMEOUT_SECONDS", "2.0"))
 PERF_LOG = os.getenv("PERF_LOG", "1") != "0"
 
 LANGUAGE_NAMES = {
@@ -257,6 +260,47 @@ MOODS = ("neutral", "happy", "excited", "thinking", "sad", "angry", "sleepy", "s
 
 class _RejectedTranscriptionLanguage(Exception):
     pass
+
+
+def pcm16_rms(data: bytes) -> int:
+    """Calculate PCM RMS with one temporary array instead of two."""
+    samples = np.frombuffer(data, dtype=np.int16)
+    if not samples.size:
+        return 0
+    float_samples = samples.astype(np.float32)
+    return int(np.sqrt(np.dot(float_samples, float_samples) / samples.size))
+
+
+def terminate_process(
+    proc: subprocess.Popen | None,
+    timeout: float = 1.0,
+    process_group: bool = False,
+) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if process_group:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if process_group:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def strip_thinking(text: str) -> str:
@@ -482,8 +526,10 @@ class LCDMoodDisplay:
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
         self.proc: subprocess.Popen | None = None
+        self.reader: threading.Thread | None = None
         self.ready = threading.Event()
         self.write_lock = threading.Lock()
+        self.closed = False
         if not enabled:
             print("[LCD] Disabled.", flush=True)
             return
@@ -521,7 +567,8 @@ class LCDMoodDisplay:
                 bufsize=1,
                 start_new_session=True,
             )
-            threading.Thread(target=self._read_output, daemon=True).start()
+            self.reader = threading.Thread(target=self._read_output, name="lcd-output-reader", daemon=True)
+            self.reader.start()
             if not self.ready.wait(timeout=8.0):
                 if self.proc.poll() is None:
                     print("[LCD_ERROR] LCD display did not report ready.", flush=True)
@@ -633,13 +680,25 @@ class LCDMoodDisplay:
         self.send_display(idea_icon=enabled)
 
     def close(self) -> None:
-        if self.proc and self.proc.poll() is None:
+        if self.closed:
+            return
+        self.closed = True
+        proc = self.proc
+        if proc and proc.poll() is None:
             try:
                 self.set_mood("sleepy", meteor_shower=False, listening_waves=False, idea_icon=False)
-                self.proc.terminate()
-                self.proc.wait(timeout=3)
             except Exception:
-                self.proc.kill()
+                pass
+            terminate_process(proc, timeout=3.0, process_group=True)
+        if proc:
+            for pipe in (proc.stdin, proc.stdout):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+        if self.reader and self.reader.is_alive() and self.reader is not threading.current_thread():
+            self.reader.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
 
 
 class HeadMotion:
@@ -755,6 +814,12 @@ def generate_thinking_sound(path: Path = THINKING_SOUND_FILE) -> Path:
     import math
     import struct
 
+    try:
+        if path.stat().st_size > 44:
+            return path
+    except OSError:
+        pass
+
     sample_rate = 16000
     tones = []
     for _ in range(random.randint(4, 8)):
@@ -792,11 +857,12 @@ def generate_thinking_sound(path: Path = THINKING_SOUND_FILE) -> Path:
 def play_thinking_sound() -> None:
     path = generate_thinking_sound()
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             ["aplay", "-q", "-D", PLAYBACK_DEVICE, str(path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        threading.Thread(target=proc.wait, name="thinking-sound-reaper", daemon=True).start()
     except Exception as e:
         print(f"[SOUND_ERROR] {e}", flush=True)
 
@@ -804,6 +870,11 @@ def play_thinking_sound() -> None:
 def generate_fast_wake_ack(path: Path = FAST_WAKE_ACK_FILE) -> bool:
     if not FAST_WAKE_ACK_ENABLED:
         return False
+    try:
+        if path.stat().st_size > 44:
+            return True
+    except OSError:
+        pass
     try:
         subprocess.run(
             [
@@ -919,6 +990,12 @@ class WhisperSTT:
         self.last_language: str | None = self.language
         self.last_language_probability: float | None = None
         self.listen_count = 0
+
+    def close(self) -> None:
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+        self.model = None
 
     def _language_hint(self) -> str | None:
         if self.language or not WHISPER_FAST_LANGUAGE_HINT:
@@ -1111,7 +1188,7 @@ class WhisperSTT:
         stop_event: threading.Event | None = None,
         quiet: bool = False,
     ) -> str:
-        chunks: list[bytes] = []
+        chunks = bytearray()
         speaking = False
         speech_started_at: float | None = None
         last_voice_at: float | None = None
@@ -1157,8 +1234,7 @@ class WhisperSTT:
                     if stderr.strip():
                         print(f"[MIC_ERROR] {stderr.strip()}", flush=True)
                     break
-                samples = np.frombuffer(data, dtype=np.int16)
-                rms = int(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+                rms = pcm16_rms(data)
                 now = time.monotonic()
 
                 if not speaking:
@@ -1186,7 +1262,9 @@ class WhisperSTT:
                         speaking = True
                         speech_started_at = now
                         last_voice_at = now
-                        chunks = list(preroll)
+                        chunks = bytearray()
+                        for preroll_chunk in preroll:
+                            chunks.extend(preroll_chunk)
                         if not quiet:
                             baseline = noise_floor_rms if noise_floor_rms is not None else 0.0
                             print(
@@ -1202,7 +1280,7 @@ class WhisperSTT:
                     continue
 
                 if speaking:
-                    chunks.append(data)
+                    chunks.extend(data)
                     end_threshold = self.voice_end_rms
                     if VOICE_DYNAMIC_RMS and noise_floor_rms is not None:
                         end_threshold = max(
@@ -1213,7 +1291,7 @@ class WhisperSTT:
                         last_voice_at = now
                     elif last_voice_at and now - last_voice_at >= self.end_silence_seconds:
                         if speech_started_at and now - speech_started_at < VOICE_MIN_RECORD_SECONDS:
-                            chunks = []
+                            chunks.clear()
                             speaking = False
                             speech_started_at = None
                             last_voice_at = None
@@ -1227,24 +1305,20 @@ class WhisperSTT:
                 if speech_started_at and now - speech_started_at >= self.max_record_seconds:
                     break
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            terminate_process(proc)
 
         if cancelled or not chunks:
             return ""
         return self._write_wav(chunks)
 
-    def _write_wav(self, chunks: list[bytes]) -> str:
+    def _write_wav(self, audio: bytes | bytearray) -> str:
         fd, wav_path = tempfile.mkstemp(prefix="whisper_input_", suffix=".wav")
         os.close(fd)
         with wave.Wave_write(wav_path) as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(MIC_SAMPLE_RATE)
-            wav.writeframes(b"".join(chunks))
+            wav.writeframes(audio)
         return wav_path
 
 
@@ -1289,6 +1363,10 @@ class VoskWakeListener:
             proc.terminate()
         if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
             self.thread.join(timeout=1.5)
+        if self.thread and self.thread.is_alive():
+            terminate_process(proc)
+            if self.thread is not threading.current_thread():
+                self.thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
         if clear_queue:
             self._clear_queue()
 
@@ -1392,12 +1470,7 @@ class VoskWakeListener:
                 )
                 return
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            terminate_process(proc)
             with self.proc_lock:
                 if self.proc is proc:
                     self.proc = None
@@ -1437,6 +1510,9 @@ class ContinuousWakeListener:
             proc.terminate()
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=1.5)
+        if self.thread and self.thread.is_alive():
+            terminate_process(proc)
+            self.thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
         if clear_queue:
             self._clear_queue()
 
@@ -1516,7 +1592,7 @@ class ContinuousWakeListener:
         chunk_seconds = chunk_bytes / float(MIC_SAMPLE_RATE * 2)
         preroll_chunks = max(1, int(WAKE_PREROLL_SECONDS / chunk_seconds))
         preroll: deque[bytes] = deque(maxlen=preroll_chunks)
-        chunks: list[bytes] = []
+        chunks = bytearray()
         speaking = False
         speech_started_at: float | None = None
         last_voice_at: float | None = None
@@ -1552,8 +1628,7 @@ class ContinuousWakeListener:
                         print(f"[MIC_ERROR] {stderr.strip()}", flush=True)
                     break
 
-                samples = np.frombuffer(data, dtype=np.int16)
-                rms = int(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
+                rms = pcm16_rms(data)
                 now = time.monotonic()
 
                 if not speaking:
@@ -1566,7 +1641,9 @@ class ContinuousWakeListener:
                         speaking = True
                         speech_started_at = now
                         last_voice_at = now
-                        chunks = list(preroll)
+                        chunks = bytearray()
+                        for preroll_chunk in preroll:
+                            chunks.extend(preroll_chunk)
                         baseline = noise_floor_rms if noise_floor_rms is not None else 0.0
                         print(
                             f"[WAKE_REC] recording wake candidate rms={rms} "
@@ -1583,7 +1660,7 @@ class ContinuousWakeListener:
                             )
                     continue
 
-                chunks.append(data)
+                chunks.extend(data)
                 baseline = noise_floor_rms if noise_floor_rms is not None else self.stt.voice_end_rms
                 end_threshold = self.stt.voice_end_rms
                 if WAKE_DYNAMIC_RMS:
@@ -1592,7 +1669,7 @@ class ContinuousWakeListener:
                     last_voice_at = now
                 elif last_voice_at and now - last_voice_at >= self.stt.end_silence_seconds:
                     self._queue_wake_candidate(chunks)
-                    chunks = []
+                    chunks = bytearray()
                     speaking = False
                     speech_started_at = None
                     last_voice_at = None
@@ -1601,30 +1678,25 @@ class ContinuousWakeListener:
 
                 if speech_started_at and now - speech_started_at >= self.stt.max_record_seconds:
                     self._queue_wake_candidate(chunks)
-                    chunks = []
+                    chunks = bytearray()
                     speaking = False
                     speech_started_at = None
                     last_voice_at = None
                     preroll.clear()
         finally:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            terminate_process(proc)
             with self.proc_lock:
                 if self.proc is proc:
                     self.proc = None
 
-    def _queue_wake_candidate(self, chunks: list[bytes]) -> None:
-        if not chunks or self.stop_event.is_set():
+    def _queue_wake_candidate(self, audio: bytes | bytearray) -> None:
+        if not audio or self.stop_event.is_set():
             return
-        record_seconds = sum(len(chunk) for chunk in chunks) / float(MIC_SAMPLE_RATE * 2)
+        record_seconds = len(audio) / float(MIC_SAMPLE_RATE * 2)
         if record_seconds < WAKE_MIN_RECORD_SECONDS:
             print(f"[WAKE_REC] Dropped too-short wake candidate ({record_seconds:.2f}s).", flush=True)
             return
-        wav_path = self.stt._write_wav(chunks)
+        wav_path = self.stt._write_wav(audio)
         while self.audio_queue.full():
             try:
                 old_path, _, _ = self.audio_queue.get_nowait()
@@ -1653,8 +1725,10 @@ class TTSProcess:
     def __init__(self, head_motion: HeadMotion | None = None, lcd_display: LCDMoodDisplay | None = None) -> None:
         self.head_motion = head_motion
         self.lcd_display = lcd_display
-        self.sync_events: "queue.Queue[str]" = queue.Queue()
-        self.display_events: "queue.Queue[tuple[str, str | bool] | None]" = queue.Queue()
+        self.sync_events: "queue.Queue[str]" = queue.Queue(maxsize=TTS_EVENT_QUEUE_SIZE)
+        self.display_events: "queue.Queue[tuple[str, str | bool] | None]" = queue.Queue(
+            maxsize=TTS_EVENT_QUEUE_SIZE
+        )
         self.pending_speech_line = ""
         self.last_done_at: float | None = None
         self.ready = threading.Event()
@@ -1662,6 +1736,7 @@ class TTSProcess:
         self.worker = Path(__file__).with_name("tts_piper_stream_worker.py")
         self.proc: subprocess.Popen[str] | None = None
         self.reader: threading.Thread | None = None
+        self.closed = False
         self._start_worker()
         self.display_thread = threading.Thread(target=self._process_display_events, daemon=True)
         self.display_thread.start()
@@ -1708,8 +1783,20 @@ class TTSProcess:
                 return
 
     def _queue_display_event(self, event: str, value: str | bool) -> None:
-        if self.lcd_display:
-            self.display_events.put((event, value))
+        if not self.lcd_display or self.closed:
+            return
+        item = (event, value)
+        try:
+            self.display_events.put_nowait(item)
+        except queue.Full:
+            try:
+                self.display_events.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.display_events.put_nowait(item)
+            except queue.Full:
+                pass
 
     def _process_display_events(self) -> None:
         while True:
@@ -1718,15 +1805,25 @@ class TTSProcess:
                 return
             if not self.lcd_display:
                 continue
-            event, value = item
-            if event == "text":
-                self.lcd_display.set_text(display_text(str(value)))
-            elif event == "meteor_shower":
-                self.lcd_display.set_meteor_shower(bool(value))
-            elif event == "listening_waves":
-                self.lcd_display.set_listening_waves(bool(value))
-            elif event == "idea_icon":
-                self.lcd_display.set_idea_icon(bool(value))
+            updates = {item[0]: item[1]}
+            should_stop = False
+            while True:
+                try:
+                    newer = self.display_events.get_nowait()
+                except queue.Empty:
+                    break
+                if newer is None:
+                    should_stop = True
+                    break
+                updates[newer[0]] = newer[1]
+            self.lcd_display.send_display(
+                text=display_text(str(updates["text"])) if "text" in updates else None,
+                meteor_shower=bool(updates["meteor_shower"]) if "meteor_shower" in updates else None,
+                listening_waves=bool(updates["listening_waves"]) if "listening_waves" in updates else None,
+                idea_icon=bool(updates["idea_icon"]) if "idea_icon" in updates else None,
+            )
+            if should_stop:
+                return
 
     def _read_output(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stdout is not None
@@ -1750,7 +1847,12 @@ class TTSProcess:
             if (line == "[TTS_DONE]" or line.startswith("[TTS_ERROR]")) and self.lcd_display:
                 self._queue_display_event("meteor_shower", False)
             if line.startswith("[TTS_SYNC_DONE] "):
-                self.sync_events.put(line.split(" ", 1)[1])
+                sync_id = line.split(" ", 1)[1]
+                try:
+                    self.sync_events.put_nowait(sync_id)
+                except queue.Full:
+                    self._drain_sync_events()
+                    self.sync_events.put_nowait(sync_id)
 
     def send(self, msg: dict) -> None:
         if self.proc is None or self.proc.poll() is not None:
@@ -1774,7 +1876,10 @@ class TTSProcess:
     def interrupt(self) -> None:
         print("[TTS_INTERRUPT] stopping current speech", flush=True)
         with self.send_lock:
+            old_reader = self.reader
             self._terminate_worker()
+            if old_reader and old_reader.is_alive() and old_reader is not threading.current_thread():
+                old_reader.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
             self._drain_sync_events()
             self.pending_speech_line = ""
             self._start_worker()
@@ -1818,6 +1923,9 @@ class TTSProcess:
                 self._queue_display_event("meteor_shower", False)
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
         try:
             if self.proc and self.proc.poll() is None:
                 try:
@@ -1832,8 +1940,20 @@ class TTSProcess:
             if self.head_motion:
                 self.head_motion.stop()
             if self.lcd_display:
-                self._queue_display_event("meteor_shower", False)
-            self.display_events.put(None)
+                self.lcd_display.set_meteor_shower(False)
+            while True:
+                try:
+                    self.display_events.put_nowait(None)
+                    break
+                except queue.Full:
+                    try:
+                        self.display_events.get_nowait()
+                    except queue.Empty:
+                        break
+            if self.display_thread.is_alive():
+                self.display_thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
+            if self.reader and self.reader.is_alive() and self.reader is not threading.current_thread():
+                self.reader.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
 
 
 class ThinkingCue:
@@ -1872,6 +1992,8 @@ class ThinkingCue:
     def stop(self) -> None:
         self.stop_event.set()
         self.lcd.set_idea_icon(False)
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
 
 
 class BargeInMonitor:
@@ -1944,8 +2066,12 @@ class OllamaStreamChat:
         self.max_messages = max_messages
         self.session = requests.Session()
         self.messages = [{"role": "system", "content": instructions}]
+        self.response_lock = threading.Lock()
+        self.active_response: requests.Response | None = None
+        self.warmup_thread: threading.Thread | None = None
         if OLLAMA_WARMUP:
-            threading.Thread(target=self._warmup, daemon=True).start()
+            self.warmup_thread = threading.Thread(target=self._warmup, name="ollama-warmup", daemon=True)
+            self.warmup_thread.start()
 
     def _request_options(self, text: str, *, warmup: bool = False) -> dict:
         num_predict = 1 if warmup else OLLAMA_NUM_PREDICT
@@ -1967,18 +2093,19 @@ class OllamaStreamChat:
     def _warmup(self) -> None:
         started = time.monotonic()
         try:
-            response = requests.post(
-                self.url,
-                json={
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": "ok"}],
-                    "stream": False,
-                    "keep_alive": OLLAMA_KEEP_ALIVE,
-                    "options": self._request_options("ok", warmup=True),
-                },
-                timeout=(2, 20),
-            )
-            response.raise_for_status()
+            with requests.Session() as warmup_session:
+                response = warmup_session.post(
+                    self.url,
+                    json={
+                        "model": self.model,
+                        "messages": [{"role": "user", "content": "ok"}],
+                        "stream": False,
+                        "keep_alive": OLLAMA_KEEP_ALIVE,
+                        "options": self._request_options("ok", warmup=True),
+                    },
+                    timeout=(2, 20),
+                )
+                response.raise_for_status()
             if PERF_LOG:
                 print(f"[PERF] ollama_warmup={time.monotonic() - started:.2f}s", flush=True)
         except Exception as e:
@@ -2006,6 +2133,8 @@ class OllamaStreamChat:
             stream=True,
             timeout=(10, None),
         )
+        with self.response_lock:
+            self.active_response = response
         try:
             response.raise_for_status()
 
@@ -2035,6 +2164,21 @@ class OllamaStreamChat:
                 print(f"[PERF] ollama_stream={time.monotonic() - request_started:.2f}s", flush=True)
         finally:
             response.close()
+            with self.response_lock:
+                if self.active_response is response:
+                    self.active_response = None
+
+    def cancel_current(self) -> None:
+        with self.response_lock:
+            response = self.active_response
+        if response is not None:
+            response.close()
+
+    def close(self) -> None:
+        self.cancel_current()
+        self.session.close()
+        if self.warmup_thread and self.warmup_thread.is_alive():
+            self.warmup_thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
 
 
 class CodexCLIChat:
@@ -2059,6 +2203,8 @@ class CodexCLIChat:
         self.max_messages = max_messages
         self.timeout = timeout
         self.messages: list[dict[str, str]] = []
+        self.proc_lock = threading.Lock()
+        self.active_proc: subprocess.Popen[str] | None = None
 
     def _trim_messages(self) -> None:
         self.messages = self.messages[-self.max_messages :]
@@ -2126,17 +2272,27 @@ class CodexCLIChat:
 
         try:
             print(f"[CHAT_BACKEND] codex cli: {' '.join(cmd[:-1])} -", flush=True)
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                input=prompt,
+                stdin=subprocess.PIPE,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=self.timeout,
-                check=False,
+                start_new_session=True,
             )
+            with self.proc_lock:
+                self.active_proc = proc
+            try:
+                stdout, stderr = proc.communicate(input=prompt, timeout=self.timeout)
+            except subprocess.TimeoutExpired as e:
+                terminate_process(proc, timeout=1.5, process_group=True)
+                raise RuntimeError(f"Codex CLI timed out after {self.timeout:g}s") from e
+            finally:
+                with self.proc_lock:
+                    if self.active_proc is proc:
+                        self.active_proc = None
             if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout).strip()
+                detail = (stderr or stdout).strip()
                 raise RuntimeError(detail or f"Codex CLI exited with code {proc.returncode}")
             reply = Path(output_path).read_text(encoding="utf-8", errors="replace").strip()
         finally:
@@ -2158,6 +2314,14 @@ class CodexCLIChat:
                 {"speech_text": speech, "speech_lang": speech_lang, "display_text": display, "mood": mood},
                 ensure_ascii=False,
             )
+
+    def cancel_current(self) -> None:
+        with self.proc_lock:
+            proc = self.active_proc
+        terminate_process(proc, timeout=1.0, process_group=True)
+
+    def close(self) -> None:
+        self.cancel_current()
 
     def _parse_reply(self, reply: str) -> dict[str, str]:
         reply = strip_thinking(reply).strip()
@@ -2248,7 +2412,7 @@ class PrefetchedChatResponse:
     def __init__(self, chat, text: str) -> None:
         self.chat = chat
         self.text = text
-        self.items: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self.items: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=CHAT_PREFETCH_QUEUE_SIZE)
         self.cancel_event = threading.Event()
         self.thread = threading.Thread(target=self._produce, daemon=True)
         self.started_at: float | None = None
@@ -2274,13 +2438,25 @@ class PrefetchedChatResponse:
                             f"backend={self.chat.display_name}",
                             flush=True,
                         )
-                self.items.put(("chunk", chunk))
+                if not self._put_item(("chunk", chunk)):
+                    break
         except Exception as e:
-            self.items.put(("error", e))
+            if not self.cancel_event.is_set():
+                self._put_item(("error", e))
         finally:
             if self.cancel_event.is_set() and stream is not None:
                 stream.close()
-            self.items.put(("done", None))
+            if not self.cancel_event.is_set():
+                self._put_item(("done", None))
+
+    def _put_item(self, item: tuple[str, object]) -> bool:
+        while not self.cancel_event.is_set():
+            try:
+                self.items.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def __iter__(self):
         while True:
@@ -2288,12 +2464,19 @@ class PrefetchedChatResponse:
             if kind == "chunk":
                 yield value
             elif kind == "error":
+                self.thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
                 raise value
             else:
+                self.thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
                 return
 
     def cancel(self) -> None:
         self.cancel_event.set()
+        cancel_current = getattr(self.chat, "cancel_current", None)
+        if callable(cancel_current):
+            cancel_current()
+        if self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(timeout=WORKER_JOIN_TIMEOUT_SECONDS)
 
 
 def pop_completed_sentences(buffer: str) -> tuple[list[str], str]:
@@ -2364,6 +2547,9 @@ def pop_speakable_chunks(buffer: str) -> tuple[list[str], str]:
 
 def main():
     wake_listener = None
+    stt = None
+    wake_stt = None
+    chat = None
     utility_mode = any(arg in sys.argv for arg in ("--tts-test", "--beep-test", "--mood-test"))
     if not utility_mode and WAKE_ENGINE in {"vosk", "auto"}:
         try:
@@ -2459,6 +2645,10 @@ def main():
         print(f"[ERROR] {e}")
         if wake_listener:
             wake_listener.stop()
+        if wake_stt is not None and wake_stt is not stt:
+            wake_stt.close()
+        if stt is not None:
+            stt.close()
         tts.close()
         lcd.close()
         head.close()
@@ -2470,6 +2660,10 @@ def main():
         print(f"[ERROR] {e}")
         if wake_listener:
             wake_listener.stop()
+        if wake_stt is not None and wake_stt is not stt:
+            wake_stt.close()
+        if stt is not None:
+            stt.close()
         tts.close()
         lcd.close()
         head.close()
@@ -2480,6 +2674,7 @@ def main():
     active_wake_phrases = WAKE_VOSK_PHRASES if isinstance(wake_listener, VoskWakeListener) else WAKE_PHRASES
     awake = False
     awake_sleep_deadline: float | None = None
+    response_stream: PrefetchedChatResponse | None = None
 
     def reset_awake_sleep_deadline(reason: str) -> None:
         nonlocal awake_sleep_deadline
@@ -2594,7 +2789,6 @@ def main():
 
             sentence_buffer = ""
             speech_chunks_queued = 0
-            response_parts = []
             response_mood_set = False
             thinking_delay = (
                 CODEX_THINKING_FILLER_DELAY_SECONDS
@@ -2647,7 +2841,6 @@ def main():
                                 speech_chunks_queued += 1
                         if response_interrupted:
                             break
-                        response_parts.append(display_chunk)
                         if STREAM_LOOP_SLEEP_SECONDS > 0:
                             time.sleep(STREAM_LOOP_SLEEP_SECONDS)
                         continue
@@ -2675,12 +2868,12 @@ def main():
                             if speech_chunk:
                                 tts.say(speech_chunk, language=speech_language)
                                 speech_chunks_queued += 1
-                            response_parts.append(display_chunk)
                             if STREAM_LOOP_SLEEP_SECONDS > 0:
                                 time.sleep(STREAM_LOOP_SLEEP_SECONDS)
                     if response_interrupted:
                         break
             except Exception as e:
+                response_stream.cancel()
                 thinking_cue.stop()
                 if barge_in.interrupted():
                     response_interrupted = True
@@ -2739,7 +2932,7 @@ def main():
                     lcd.set_mood(choose_mood(display_tail))
                 if speech_tail and not barge_in.interrupted():
                     tts.say(speech_tail, language=speech_language)
-                response_parts.append(display_tail)
+                    speech_chunks_queued += 1
 
             tts.wait_until_done(interrupt_event=barge_in.interrupt_event)
             if barge_in.interrupted():
@@ -2750,6 +2943,7 @@ def main():
                 time.sleep(0.05)
                 continue
             barge_in.stop()
+            response_stream = None
             reset_awake_sleep_deadline("after response")
             time.sleep(0.05)
 
@@ -2758,6 +2952,15 @@ def main():
     finally:
         wake_listener.stop()
         barge_in.stop()
+        if response_stream is not None:
+            response_stream.cancel()
+        close_chat = getattr(chat, "close", None)
+        if callable(close_chat):
+            close_chat()
+        if wake_stt is not None and wake_stt is not stt:
+            wake_stt.close()
+        if stt is not None:
+            stt.close()
         lcd.set_mood("sleepy", text="Goodbye!", listening_waves=False)
         if tts.ready.is_set():
             tts.say("Goodbye!")

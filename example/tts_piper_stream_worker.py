@@ -1,4 +1,5 @@
 import json
+import asyncio
 import math
 import os
 import random
@@ -27,6 +28,7 @@ KOKORO_CHINESE_SPEED = float(os.getenv("KOKORO_CHINESE_SPEED", "1"))
 KOKORO_CHINESE_VARIANT = os.getenv("KOKORO_CHINESE_VARIANT", "v1.1-zh")
 
 kokoro_chinese_pipeline = None
+inter_sentence_beeps: list[str] = []
 
 
 def play_wav(path: str) -> None:
@@ -71,10 +73,14 @@ def generate_inter_sentence_beep() -> str:
 
 
 def play_inter_sentence_beep() -> None:
-    wav_path = generate_inter_sentence_beep()
-    try:
-        play_wav(wav_path)
-    finally:
+    if not inter_sentence_beeps:
+        inter_sentence_beeps.extend(generate_inter_sentence_beep() for _ in range(6))
+    play_wav(random.choice(inter_sentence_beeps))
+
+
+def cleanup_inter_sentence_beeps() -> None:
+    while inter_sentence_beeps:
+        wav_path = inter_sentence_beeps.pop()
         try:
             os.unlink(wav_path)
         except OSError:
@@ -163,29 +169,19 @@ def synthesize_chinese_kokoro(text: str, wav_path: str) -> None:
 
 
 def synthesize_chinese_edge(text: str, wav_path: str) -> None:
+    import edge_tts
+
     with tempfile.NamedTemporaryFile(prefix="edge_tts_", suffix=".mp3", delete=False) as media:
         media_path = media.name
     try:
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "edge_tts",
-                "--voice",
-                EDGE_TTS_VOICE,
-                "--rate",
-                EDGE_TTS_RATE,
-                "--volume",
-                EDGE_TTS_VOLUME,
-                "--pitch",
-                EDGE_TTS_PITCH,
-                "--text",
-                text,
-                "--write-media",
-                media_path,
-            ],
-            check=True,
+        communicate = edge_tts.Communicate(
+            text,
+            EDGE_TTS_VOICE,
+            rate=EDGE_TTS_RATE,
+            volume=EDGE_TTS_VOLUME,
+            pitch=EDGE_TTS_PITCH,
         )
+        asyncio.run(communicate.save(media_path))
         subprocess.run(
             [
                 "ffmpeg",
@@ -235,56 +231,58 @@ def main() -> int:
     tts.set_model(TTS_MODEL)
     print("[TTS_READY]", flush=True)
 
-    for line in sys.stdin:
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError as e:
-            print(f"[TTS_ERROR] bad json: {e}", flush=True)
-            continue
-
-        command = msg.get("command")
-        if command == "say":
-            text = normalize_for_tts(msg.get("text", ""))
-            language = normalize_language(str(msg.get("language", "")), text)
-            display_text = bool(msg.get("display", True))
-            if text:
-                segments = split_chinese_tts_sentences(text) if language == "zh" else [text]
-                for segment in segments:
-                    event = "TTS_START" if display_text else "TTS_START_HIDDEN"
-                    print(f"[{event}] lang={language} {segment}", flush=True)
-                    wav_path = None
-                    try:
-                        with tempfile.NamedTemporaryFile(prefix="piper_tts_", suffix=".wav", delete=False) as wav:
-                            wav_path = wav.name
-                        if language == "zh":
-                            synthesize_chinese(segment, wav_path)
-                        else:
-                            tts.tts(segment, wav_path)
-                        print("[TTS_PLAY_START]", flush=True)
-                        play_wav(wav_path)
-                    except Exception as e:
-                        print(f"[TTS_ERROR] {e}", flush=True)
-                    finally:
-                        if wav_path:
-                            try:
-                                os.unlink(wav_path)
-                            except OSError:
-                                pass
-                print("[TTS_DONE]", flush=True)
-        elif command == "beep":
+    try:
+        for line in sys.stdin:
             try:
-                print("[TTS_BEEP]", flush=True)
-                play_inter_sentence_beep()
-            except Exception as e:
-                print(f"[TTS_ERROR] beep failed: {e}", flush=True)
-        elif command == "sync":
-            print(f"[TTS_SYNC_DONE] {msg.get('id', '')}", flush=True)
-        elif command == "quit":
-            if kokoro_chinese_pipeline is not None:
-                kokoro_chinese_pipeline.close()
-            return 0
+                msg = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"[TTS_ERROR] bad json: {e}", flush=True)
+                continue
 
-    return 0
+            command = msg.get("command")
+            if command == "say":
+                text = normalize_for_tts(msg.get("text", ""))
+                language = normalize_language(str(msg.get("language", "")), text)
+                display_text = bool(msg.get("display", True))
+                if text:
+                    segments = split_chinese_tts_sentences(text) if language == "zh" else [text]
+                    for segment in segments:
+                        event = "TTS_START" if display_text else "TTS_START_HIDDEN"
+                        print(f"[{event}] lang={language} {segment}", flush=True)
+                        wav_path = None
+                        try:
+                            with tempfile.NamedTemporaryFile(prefix="piper_tts_", suffix=".wav", delete=False) as wav:
+                                wav_path = wav.name
+                            if language == "zh":
+                                synthesize_chinese(segment, wav_path)
+                            else:
+                                tts.tts(segment, wav_path)
+                            print("[TTS_PLAY_START]", flush=True)
+                            play_wav(wav_path)
+                        except Exception as e:
+                            print(f"[TTS_ERROR] {e}", flush=True)
+                        finally:
+                            if wav_path:
+                                try:
+                                    os.unlink(wav_path)
+                                except OSError:
+                                    pass
+                    print("[TTS_DONE]", flush=True)
+            elif command == "beep":
+                try:
+                    print("[TTS_BEEP]", flush=True)
+                    play_inter_sentence_beep()
+                except Exception as e:
+                    print(f"[TTS_ERROR] beep failed: {e}", flush=True)
+            elif command == "sync":
+                print(f"[TTS_SYNC_DONE] {msg.get('id', '')}", flush=True)
+            elif command == "quit":
+                return 0
+        return 0
+    finally:
+        if kokoro_chinese_pipeline is not None:
+            kokoro_chinese_pipeline.close()
+        cleanup_inter_sentence_beeps()
 
 
 if __name__ == "__main__":
