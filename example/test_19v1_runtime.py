@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import ImageChops
@@ -36,6 +37,29 @@ class FastDummyChat:
         self.cancelled.set()
 
 
+class FakeCTranslateWhisper:
+    is_multilingual = True
+
+    def __init__(self, probabilities):
+        self.probabilities = probabilities
+
+    def detect_language(self, _encoder_output):
+        return [self.probabilities]
+
+
+class FakeWhisperModel:
+    def __init__(self, language_model):
+        self.model = language_model
+        self.kwargs = None
+
+    def transcribe(self, _audio, **kwargs):
+        self.kwargs = kwargs
+        if kwargs.get("multilingual"):
+            self.model.detect_language(None)
+        info = SimpleNamespace(language=kwargs.get("language"), language_probability=1.0)
+        return iter((SimpleNamespace(text=" 你好，皮卡丘。"),)), info
+
+
 class RuntimeTests(unittest.TestCase):
     def test_pcm16_rms_matches_reference(self):
         generator = np.random.default_rng(19)
@@ -55,6 +79,55 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(response.items.qsize(), VOICE_CHATBOT.CHAT_PREFETCH_QUEUE_SIZE)
         response.cancel()
         self.assertFalse(response.thread.is_alive())
+
+    def test_shared_encoder_selects_allowed_language_and_hotwords(self):
+        raw_model = FakeCTranslateWhisper(
+            [
+                ("<|ja|>", 0.44),
+                ("<|zh|>", 0.41),
+                ("<|en|>", 0.08),
+            ]
+        )
+        limiter = VOICE_CHATBOT._AllowedLanguageModelProxy(raw_model, ("en", "zh"))
+        fake_model = FakeWhisperModel(limiter)
+        stt = VOICE_CHATBOT.WhisperSTT.__new__(VOICE_CHATBOT.WhisperSTT)
+        stt.model = fake_model
+        stt.model_lock = threading.Lock()
+        stt.language_limiter = limiter
+        stt.language = None
+        stt.last_language = None
+        stt.last_language_probability = None
+        stt.listen_count = 0
+        stt.beam_size = 2
+        stt.vad_filter = False
+        stt.supports_without_timestamps = True
+        stt.hotwords = "Pikachu 皮卡丘"
+
+        text, mode, probability = stt._transcribe_local("unused.wav")
+
+        self.assertEqual(text, "你好，皮卡丘。")
+        self.assertEqual(mode, "shared-encoder-auto")
+        self.assertEqual(stt.last_language, "zh")
+        self.assertAlmostEqual(probability, 0.41)
+        self.assertTrue(fake_model.kwargs["multilingual"])
+        self.assertEqual(fake_model.kwargs["language"], "en")
+        self.assertEqual(fake_model.kwargs["hotwords"], "Pikachu 皮卡丘")
+
+    def test_shared_encoder_rejects_confident_unsupported_language(self):
+        raw_model = FakeCTranslateWhisper(
+            [
+                ("<|es|>", 0.82),
+                ("<|en|>", 0.07),
+                ("<|zh|>", 0.03),
+            ]
+        )
+        limiter = VOICE_CHATBOT._AllowedLanguageModelProxy(raw_model, ("en", "zh"))
+
+        with self.assertRaises(VOICE_CHATBOT._RejectedTranscriptionLanguage):
+            limiter.detect_language(None)
+
+        self.assertTrue(limiter.last_detection["rejected"])
+        self.assertEqual(limiter.last_detection["selected"], "en")
 
     def test_terminate_process_reaps_child(self):
         proc = subprocess.Popen(

@@ -101,11 +101,25 @@ if WHISPER_LANGUAGE in {"", "auto", "detect"}:
     WHISPER_LANGUAGE = None
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+WHISPER_CPU_THREADS = int(
+    os.getenv("WHISPER_CPU_THREADS", str(min(4, max(1, os.cpu_count() or 1))))
+)
+WHISPER_NUM_WORKERS = max(1, int(os.getenv("WHISPER_NUM_WORKERS", "1")))
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "2"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "0") != "0"
 WHISPER_WITHOUT_TIMESTAMPS = os.getenv("WHISPER_WITHOUT_TIMESTAMPS", "1") != "0"
 WHISPER_TEMPERATURE = float(os.getenv("WHISPER_TEMPERATURE", "0"))
 WHISPER_BEST_OF = int(os.getenv("WHISPER_BEST_OF", "1"))
+WHISPER_SHARED_ENCODER_LANGUAGE_DETECTION = (
+    os.getenv("WHISPER_SHARED_ENCODER_LANGUAGE_DETECTION", "1") != "0"
+)
+WHISPER_HOTWORDS = os.getenv(
+    "WHISPER_HOTWORDS",
+    (
+        "Pikachu PiCar-X Codex Ollama OpenAI Raspberry Pi robot supernova meteor shower "
+        "Saturn photosynthesis New York 皮卡丘 派卡車 機器人 超新星 流星雨 土星 光合作用 紐約"
+    ),
+).strip()
 WHISPER_ALLOWED_LANGUAGES = tuple(
     dict.fromkeys(
         "zh" if language.strip().lower() in {"zh", "cmn", "mandarin", "chinese"} else "en"
@@ -182,6 +196,10 @@ if WAKE_WHISPER_LANGUAGE in {"", "auto", "detect"}:
     WAKE_WHISPER_LANGUAGE = None
 WAKE_WHISPER_BEAM_SIZE = int(os.getenv("WAKE_WHISPER_BEAM_SIZE", "1"))
 WAKE_WHISPER_VAD_FILTER = os.getenv("WAKE_WHISPER_VAD_FILTER", "0") != "0"
+WAKE_WHISPER_HOTWORDS = os.getenv(
+    "WAKE_WHISPER_HOTWORDS",
+    "hello robot hey robot hello Robert hey Robert yellow robot halo robot",
+).strip()
 WAKE_STT_BACKEND = os.getenv("WAKE_STT_BACKEND", "local").strip().lower()
 if WAKE_STT_BACKEND in {"api", "cloud", "gpt"}:
     WAKE_STT_BACKEND = "openai"
@@ -260,6 +278,61 @@ MOODS = ("neutral", "happy", "excited", "thinking", "sad", "angry", "sleepy", "s
 
 class _RejectedTranscriptionLanguage(Exception):
     pass
+
+
+class _AllowedLanguageModelProxy:
+    """Filter CTranslate2 language results while reusing its encoder output."""
+
+    def __init__(self, model, allowed_languages: tuple[str, ...]) -> None:
+        self._model = model
+        self.allowed_tokens = frozenset(f"<|{language}|>" for language in allowed_languages)
+        self.last_detection: dict[str, str | float | bool] = {}
+
+    def __getattr__(self, name):
+        return getattr(self._model, name)
+
+    def reset_detection(self) -> None:
+        self.last_detection = {}
+
+    @staticmethod
+    def _language_code(token: str) -> str:
+        return token[2:-2] if token.startswith("<|") and token.endswith("|>") else token
+
+    def detect_language(self, encoder_output):
+        filtered_batches = []
+        for probabilities in self._model.detect_language(encoder_output):
+            if not probabilities:
+                filtered_batches.append(probabilities)
+                continue
+            allowed = [item for item in probabilities if item[0] in self.allowed_tokens]
+            if not allowed:
+                filtered_batches.append(probabilities)
+                continue
+
+            detected_token, detected_probability = probabilities[0]
+            selected_token, selected_probability = max(allowed, key=lambda item: item[1])
+            detected = self._language_code(detected_token)
+            selected = self._language_code(selected_token)
+            self.last_detection = {
+                "detected": detected,
+                "detected_probability": detected_probability,
+                "selected": selected,
+                "selected_probability": selected_probability,
+            }
+            if (
+                detected_token not in self.allowed_tokens
+                and selected_probability < WHISPER_LANGUAGE_REJECT_MIN_PROB
+                and detected_probability - selected_probability >= WHISPER_LANGUAGE_REJECT_MARGIN
+            ):
+                self.last_detection["rejected"] = True
+                raise _RejectedTranscriptionLanguage
+
+            selected_item = (selected_token, selected_probability)
+            filtered_batches.append(
+                [selected_item]
+                + [item for item in probabilities if item != selected_item]
+            )
+        return filtered_batches
 
 
 def pcm16_rms(data: bytes) -> int:
@@ -941,6 +1014,7 @@ class WhisperSTT:
         voice_end_rms: int,
         end_silence_seconds: float,
         max_record_seconds: float,
+        hotwords: str = "",
     ) -> None:
         self.label = label
         self.backend = backend
@@ -952,10 +1026,13 @@ class WhisperSTT:
         self.voice_end_rms = voice_end_rms
         self.end_silence_seconds = end_silence_seconds
         self.max_record_seconds = max_record_seconds
+        self.hotwords = hotwords.strip()
         self.model = None
+        self.language_limiter: _AllowedLanguageModelProxy | None = None
         self.session: requests.Session | None = None
         self.openai_api_key = ""
         self.supports_without_timestamps = False
+        self.supports_multilingual = False
         self.model_lock = threading.Lock()
 
         if self.backend == "local":
@@ -972,11 +1049,34 @@ class WhisperSTT:
                 self.model_name,
                 device=WHISPER_DEVICE,
                 compute_type=WHISPER_COMPUTE_TYPE,
+                cpu_threads=WHISPER_CPU_THREADS,
+                num_workers=WHISPER_NUM_WORKERS,
             )
             try:
-                self.supports_without_timestamps = "without_timestamps" in inspect.signature(self.model.transcribe).parameters
+                transcribe_parameters = inspect.signature(self.model.transcribe).parameters
+                self.supports_without_timestamps = "without_timestamps" in transcribe_parameters
+                self.supports_multilingual = "multilingual" in transcribe_parameters
             except (TypeError, ValueError):
                 self.supports_without_timestamps = False
+                self.supports_multilingual = False
+            if (
+                not self.language
+                and WHISPER_ALLOWED_LANGUAGES
+                and WHISPER_SHARED_ENCODER_LANGUAGE_DETECTION
+                and self.supports_multilingual
+                and self.model.model.is_multilingual
+            ):
+                self.language_limiter = _AllowedLanguageModelProxy(
+                    self.model.model,
+                    WHISPER_ALLOWED_LANGUAGES,
+                )
+                self.model.model = self.language_limiter
+            print(
+                f"[STT:{self.label}] threads={WHISPER_CPU_THREADS} workers={WHISPER_NUM_WORKERS} "
+                f"shared_language_encoder={int(self.language_limiter is not None)} "
+                f"hotwords={int(bool(self.hotwords))}",
+                flush=True,
+            )
         elif self.backend == "openai":
             self.openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
             if not self.openai_api_key:
@@ -995,6 +1095,7 @@ class WhisperSTT:
         if self.session is not None:
             self.session.close()
             self.session = None
+        self.language_limiter = None
         self.model = None
 
     def _language_hint(self) -> str | None:
@@ -1068,23 +1169,46 @@ class WhisperSTT:
         }
         if WHISPER_WITHOUT_TIMESTAMPS and self.supports_without_timestamps:
             transcribe_kwargs["without_timestamps"] = True
+        if self.hotwords:
+            transcribe_kwargs["hotwords"] = self.hotwords
         hint_language = self._language_hint()
+        shared_detection = bool(
+            not self.language
+            and not hint_language
+            and self.language_limiter is not None
+        )
         if self.language:
             transcribe_kwargs["language"] = self.language
         elif hint_language:
             transcribe_kwargs["language"] = hint_language
+        elif shared_detection:
+            transcribe_kwargs["language"] = WHISPER_ALLOWED_LANGUAGES[0]
+            transcribe_kwargs["multilingual"] = True
         detection = {}
 
         # faster-whisper exposes every language score but has no whitelist.
-        # Constrain its detector before it creates the tokenizer so decoding can
-        # only enter the English or Mandarin path without an expensive retry.
-        limit_detection = not self.language and not hint_language and bool(WHISPER_ALLOWED_LANGUAGES)
+        # Older versions need the outer detector patched before tokenizer
+        # creation. Newer versions filter the detector attached to the shared
+        # transcription encoder, avoiding a duplicate encoder pass.
+        limit_detection = (
+            not self.language
+            and not hint_language
+            and bool(WHISPER_ALLOWED_LANGUAGES)
+            and not shared_detection
+        )
         with self.model_lock:
-            original_detector = self.model.detect_language
-            had_instance_detector = "detect_language" in vars(self.model)
-            previous_instance_detector = vars(self.model).get("detect_language")
+            original_detector = None
+            had_instance_detector = False
+            previous_instance_detector = None
+            if shared_detection:
+                self.language_limiter.reset_detection()
             if limit_detection:
+                original_detector = self.model.detect_language
+                had_instance_detector = "detect_language" in vars(self.model)
+                previous_instance_detector = vars(self.model).get("detect_language")
+
                 def detect_allowed_language(*args, **kwargs):
+                    assert original_detector is not None
                     detected, detected_probability, all_probabilities = original_detector(*args, **kwargs)
                     probabilities = dict(all_probabilities)
                     selected = max(
@@ -1115,7 +1239,11 @@ class WhisperSTT:
                         **transcribe_kwargs,
                     )
                     segments = list(segments)
+                    if shared_detection:
+                        detection.update(self.language_limiter.last_detection)
                 except _RejectedTranscriptionLanguage:
+                    if shared_detection:
+                        detection.update(self.language_limiter.last_detection)
                     segments = []
                     info = None
             finally:
@@ -1135,14 +1263,26 @@ class WhisperSTT:
             )
             return "", "rejected-outside-en-zh", detection["selected_probability"]
 
-        detected_language = getattr(info, "language", None)
-        language_probability = getattr(info, "language_probability", None)
+        if shared_detection and detection:
+            detected_language = str(detection.get("selected") or "")
+            language_probability = float(detection.get("selected_probability") or 0.0)
+        else:
+            detected_language = getattr(info, "language", None)
+            language_probability = getattr(info, "language_probability", None)
         self.last_language = self.language or detected_language or hint_language
         if language_probability is not None:
             self.last_language_probability = language_probability
         elif not hint_language:
             self.last_language_probability = None
-        mode = "forced" if self.language else "hint" if hint_language else "limited-auto"
+        mode = (
+            "forced"
+            if self.language
+            else "hint"
+            if hint_language
+            else "shared-encoder-auto"
+            if shared_detection
+            else "limited-auto"
+        )
         if detection and detection["detected"] != detection["selected"]:
             print(
                 f"[STT_LANG_LIMIT] rejected={detection['detected']}({detection['detected_probability']:.2f}) "
@@ -2613,6 +2753,7 @@ def main():
             voice_end_rms=VOICE_END_RMS,
             end_silence_seconds=END_SILENCE_SECONDS,
             max_record_seconds=MAX_RECORD_SECONDS,
+            hotwords=WHISPER_HOTWORDS,
         )
         if wake_listener is None:
             wake_stt_model = WAKE_OPENAI_TRANSCRIBE_MODEL if WAKE_STT_BACKEND == "openai" else WAKE_WHISPER_MODEL
@@ -2639,6 +2780,7 @@ def main():
                     voice_end_rms=WAKE_VOICE_END_RMS,
                     end_silence_seconds=WAKE_END_SILENCE_SECONDS,
                     max_record_seconds=WAKE_MAX_RECORD_SECONDS,
+                    hotwords=WAKE_WHISPER_HOTWORDS,
                 )
             wake_listener = ContinuousWakeListener(wake_stt)
     except RuntimeError as e:
