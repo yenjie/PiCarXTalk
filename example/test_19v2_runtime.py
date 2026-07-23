@@ -316,15 +316,31 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(proc.poll())
 
     def test_all_moods_and_activity_states_render(self):
-        for mood in VALID_MOODS:
-            with render_pikachu((320, 240), mood, tick=17) as frame:
-                self.assertEqual(frame.size, (320, 240))
+        mood_frames = {}
+        for size in ((320, 240), (280, 240)):
+            for mood in VALID_MOODS:
+                with render_pikachu(size, mood, tick=17) as frame:
+                    self.assertEqual(frame.size, size)
+                    self.assertEqual(frame.mode, "RGB")
+                    self.assertIsNotNone(frame.getbbox())
+                    if size == (320, 240):
+                        mood_frames[mood] = frame.tobytes()
+
+        self.assertEqual(len(set(mood_frames.values())), len(VALID_MOODS))
 
         with render_pikachu((320, 240), "happy", tick=24) as idle:
             with render_pikachu((320, 240), "happy", tick=24, talking=True) as talking:
                 self.assertIsNotNone(ImageChops.difference(idle, talking).getbbox())
             with render_pikachu((320, 240), "happy", tick=24, listening=True) as listening:
                 self.assertIsNotNone(ImageChops.difference(idle, listening).getbbox())
+
+        for mood in VALID_MOODS:
+            with render_pikachu((280, 240), mood, tick=4) as early:
+                with render_pikachu((280, 240), mood, tick=21) as later:
+                    self.assertIsNotNone(
+                        ImageChops.difference(early, later).getbbox(),
+                        f"{mood} should animate between ticks",
+                    )
 
 
 if __name__ == "__main__":

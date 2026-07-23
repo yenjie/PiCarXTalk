@@ -39,6 +39,12 @@ the worker is still synthesizing and cannot stop promptly, it uses a bounded
 hard stop and waits until follow-up transcription is complete before reloading
 Piper. See [PERFORMANCE_19v2.md](PERFORMANCE_19v2.md) for measurements.
 
+## Pikachu Display
+
+Both supported LCD sizes use the same animated Pikachu renderer. The nine moods
+have distinct expressions, posture, and scenery while retaining the lower
+subtitle area for English, Traditional Chinese, and mixed-language responses.
+
 ## Test
 
 ```bash
