@@ -3,7 +3,8 @@
 `19v1` is a bilingual English/Mandarin voice-chat program for PiCar-X. It uses:
 
 - streaming Vosk wake detection for `hello robot` and `hey robot`;
-- local faster-whisper transcription constrained to English and Mandarin;
+- local faster-whisper transcription constrained to English and Mandarin, with shared-encoder
+  language detection and bilingual terminology hints;
 - Codex CLI or local Ollama responses;
 - English Piper and Taiwanese Mandarin TTS;
 - animated Pikachu moods with speaking/listening motion, bilingual response text, and 1.69-inch or 2.4-inch SPI LCD output;
@@ -49,7 +50,15 @@ The runner defaults to Codex, the 2.4-inch LCD, and direct HifiBerry output. Exa
 TTS_PLAYBACK_DEVICE=pulse ./run_19v1.sh
 ```
 
-Useful environment settings include `CODEX_MODEL`, `OLLAMA_MODEL`, `MIC_ALSA_DEVICE`, `LCD_SCREEN`, `LCD_PYTHON_DIR`, `TTS_PLAYBACK_DEVICE`, `WHISPER_MODEL`, `THINKING_FILLERS_EN`, and `THINKING_FILLERS_ZH`.
+Useful environment settings include `CODEX_MODEL`, `OLLAMA_MODEL`, `MIC_ALSA_DEVICE`, `LCD_SCREEN`,
+`LCD_PYTHON_DIR`, `TTS_PLAYBACK_DEVICE`, `WHISPER_MODEL`, `WHISPER_HOTWORDS`,
+`THINKING_FILLERS_EN`, and `THINKING_FILLERS_ZH`.
+
+The launcher uses four CTranslate2 CPU threads, one model worker, and shared-encoder language
+detection by default. `WHISPER_HOTWORDS` is a space-separated list of names and terms that should
+receive extra decoder weight. Replace it with vocabulary important to your conversations, or set it
+to an empty string to disable hints. Set `WHISPER_SHARED_ENCODER_LANGUAGE_DETECTION=0` to use
+faster-whisper's older two-pass detector as a compatibility fallback.
 
 While the robot is responding, interruption is intentionally stricter than wake-from-sleep recognition. By default, only exact `hello robot` or `hey robot` interrupts a response. Set `BARGE_IN_PHRASES` to customize that list; permissive wake aliases remain available while sleeping.
 
