@@ -203,10 +203,11 @@ def _draw_eyes(draw, mood, tick, bob, listening):
         return
     listening_look = int(math.sin(tick / 7.0) * 6) if listening else 0
     if mood == "happy":
-        _normal_eye(draw, left_x, y, look=listening_look, wide=True)
-        _normal_eye(draw, right_x, y, look=listening_look, wide=True)
-        _spark(draw, left_x + 3, y - 3, 11, "#ffffff", width=4)
-        _spark(draw, right_x + 3, y - 3, 11, "#ffffff", width=4)
+        eye_lift = int((math.sin(tick / 5.0) + 1) * 2)
+        draw.arc((126, y - 30 - eye_lift, 214, y + 30), 195, 345, fill=INK, width=10)
+        draw.arc((266, y - 30 - eye_lift, 354, y + 30), 195, 345, fill=INK, width=10)
+        draw.line((132, y - 8, 119, y - 18), fill=INK, width=5)
+        draw.line((348, y - 8, 361, y - 18), fill=INK, width=5)
     elif mood == "excited":
         _normal_eye(draw, left_x, y, wide=True)
         _normal_eye(draw, right_x, y, wide=True)
