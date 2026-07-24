@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import ImageChops
 
-from lcd_pikachu_renderer import VALID_MOODS, render_pikachu
+from lcd_pikachu_renderer import EAR_POSES, VALID_MOODS, render_pikachu
 
 
 MODULE_PATH = Path(__file__).with_name("19v2.local_voice_chatbot_interrupt_followup.py")
@@ -89,10 +89,14 @@ class FakeTTS:
     def __init__(self):
         self.interrupt_calls = 0
         self.interrupt_restarts = []
+        self.say_calls = []
 
     def interrupt(self, restart=True):
         self.interrupt_calls += 1
         self.interrupt_restarts.append(restart)
+
+    def say(self, text, **kwargs):
+        self.say_calls.append((text, kwargs))
 
 
 class FakeLCD:
@@ -121,8 +125,10 @@ class FakeOllamaResponse:
 class FakeOllamaSession:
     def __init__(self, response):
         self.response = response
+        self.last_kwargs = None
 
     def post(self, *_args, **_kwargs):
+        self.last_kwargs = _kwargs
         return self.response
 
 
@@ -151,6 +157,267 @@ class RuntimeTests(unittest.TestCase):
         samples = generator.integers(-32768, 32767, size=4096, dtype=np.int16)
         expected = int(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
         self.assertLessEqual(abs(VOICE_CHATBOT.pcm16_rms(samples.tobytes()) - expected), 1)
+
+    def test_noise_floor_does_not_quickly_absorb_quiet_speech(self):
+        noise_floor = 180.0
+        for _ in range(3):
+            noise_floor = VOICE_CHATBOT.update_noise_floor(noise_floor, 500)
+        self.assertLess(noise_floor, 200)
+
+        falling_floor = VOICE_CHATBOT.update_noise_floor(noise_floor, 100)
+        self.assertLess(falling_floor, noise_floor)
+
+    def test_transcript_normalization_preserves_english_and_cleans_chinese(self):
+        self.assertEqual(
+            VOICE_CHATBOT.normalize_transcript_text("提醒我 明天早上 带雨伞 ？", "zh"),
+            "提醒我明天早上帶雨傘？",
+        )
+        self.assertEqual(
+            VOICE_CHATBOT.normalize_transcript_text("Pikachu 在 厨房 里", "zh"),
+            "Pikachu 在廚房裡",
+        )
+        self.assertEqual(
+            VOICE_CHATBOT.normalize_transcript_text("What is the weather today ?", "en"),
+            "What is the weather today?",
+        )
+
+    def test_default_hotwords_cover_common_bilingual_prompt_phrases(self):
+        for phrase in ("remind me", "set a timer", "帶雨傘", "請用", "光合作用"):
+            self.assertIn(phrase, VOICE_CHATBOT.WHISPER_HOTWORDS)
+
+    def test_vosk_wake_gate_accepts_only_exact_robot_phrases(self):
+        self.assertTrue(VOICE_CHATBOT.is_vosk_wake_request("hello robot"))
+        self.assertTrue(VOICE_CHATBOT.is_vosk_wake_request("Hey, robot!"))
+        for near_match in (
+            "hello robert",
+            "hey robert",
+            "yellow robot",
+            "halo robot",
+            "hello rabbit",
+            "hello",
+            "robot",
+        ):
+            self.assertFalse(
+                VOICE_CHATBOT.is_vosk_wake_request(near_match),
+                near_match,
+            )
+
+        self.assertTrue(
+            set(VOICE_CHATBOT.WAKE_VOSK_PHRASES).isdisjoint(
+                VOICE_CHATBOT.WAKE_VOSK_REJECT_PHRASES
+            )
+        )
+
+    def test_important_memory_selection_is_bilingual_and_rejects_secrets(self):
+        english = VOICE_CHATBOT.extract_important_memory(
+            "Please remember that my name is Yenjie.",
+            "en",
+        )
+        mandarin = VOICE_CHATBOT.extract_important_memory(
+            "请记住我喜欢喝茶。",
+            "zh",
+        )
+
+        self.assertEqual(english["text"], "my name is Yenjie.")
+        self.assertEqual(english["topic"], "name")
+        self.assertEqual(mandarin["text"], "我喜歡喝茶。")
+        self.assertEqual(mandarin["language"], "zh")
+        self.assertIsNone(
+            VOICE_CHATBOT.extract_important_memory("What is my favorite color?", "en")
+        )
+        self.assertIsNone(
+            VOICE_CHATBOT.extract_important_memory(
+                "Remember my API key is secret-123.",
+                "en",
+            )
+        )
+
+    def test_important_memory_persists_deduplicates_and_updates_singleton_facts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_path = Path(temp_dir) / "important.json"
+            store = VOICE_CHATBOT.ImportantMemoryStore(memory_path, max_items=3)
+            first_name = VOICE_CHATBOT.extract_important_memory("My name is Yenjie.", "en")
+            new_name = VOICE_CHATBOT.extract_important_memory("My name is Alex.", "en")
+            preference = VOICE_CHATBOT.extract_important_memory("I prefer short answers.", "en")
+
+            self.assertTrue(store.remember(first_name))
+            self.assertFalse(store.remember(first_name))
+            self.assertTrue(store.remember(preference))
+            self.assertTrue(store.remember(new_name))
+            self.assertEqual(memory_path.stat().st_mode & 0o777, 0o600)
+
+            reloaded = VOICE_CHATBOT.ImportantMemoryStore(memory_path, max_items=3)
+            context = reloaded.prompt_context()
+            self.assertNotIn("My name is Yenjie.", context)
+            self.assertIn("My name is Alex.", context)
+            self.assertIn("I prefer short answers.", context)
+            self.assertEqual(len(reloaded.memories), 2)
+
+    def test_important_memory_store_remains_bounded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_path = Path(temp_dir) / "important.json"
+            store = VOICE_CHATBOT.ImportantMemoryStore(memory_path, max_items=3)
+            for index in range(8):
+                self.assertTrue(
+                    store.remember(
+                        {
+                            "text": f"I like preference {index}.",
+                            "language": "en",
+                            "topic": "",
+                        }
+                    )
+                )
+
+            self.assertEqual(len(store.memories), 3)
+            self.assertNotIn("preference 4", store.prompt_context())
+            self.assertIn("preference 7", store.prompt_context())
+            self.assertEqual(
+                len(VOICE_CHATBOT.ImportantMemoryStore(memory_path, max_items=3).memories),
+                3,
+            )
+
+    def test_memory_commands_parse_in_english_and_mandarin(self):
+        cases = (
+            ("What do you remember about me?", "list"),
+            ("List my memories.", "list"),
+            ("Forget green tea.", "forget"),
+            ("Forget everything.", "clear_request"),
+            ("Confirm forget everything.", "clear_confirm"),
+            ("你記得我什麼？", "list"),
+            ("請忘記綠茶。", "forget"),
+            ("清除所有记忆。", "clear_request"),
+            ("确认忘记全部。", "clear_confirm"),
+        )
+        for text, expected_action in cases:
+            with self.subTest(text=text):
+                command = VOICE_CHATBOT.parse_memory_command(text)
+                self.assertIsNotNone(command)
+                self.assertEqual(command["action"], expected_action)
+
+        self.assertIsNone(VOICE_CHATBOT.parse_memory_command("What is the weather?"))
+
+    def test_memory_forget_and_guarded_clear_persist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_path = Path(temp_dir) / "important.json"
+            store = VOICE_CHATBOT.ImportantMemoryStore(memory_path)
+            store.remember(
+                VOICE_CHATBOT.extract_important_memory("My name is Yenjie.", "en")
+            )
+            store.remember(
+                VOICE_CHATBOT.extract_important_memory("I like green tea.", "en")
+            )
+
+            clear_request = VOICE_CHATBOT.execute_memory_command(
+                store,
+                {"action": "clear_request", "target": ""},
+                "en",
+            )
+            self.assertTrue(clear_request["needs_clear_confirmation"])
+            self.assertEqual(len(store.snapshot()), 2)
+
+            unconfirmed = VOICE_CHATBOT.execute_memory_command(
+                store,
+                {"action": "clear_confirm", "target": ""},
+                "en",
+            )
+            self.assertIn("no pending", str(unconfirmed["text"]).lower())
+            self.assertEqual(len(store.snapshot()), 2)
+
+            forgotten = VOICE_CHATBOT.execute_memory_command(
+                store,
+                {"action": "forget", "target": "green tea"},
+                "en",
+            )
+            self.assertIn("I forgot:", forgotten["text"])
+            self.assertEqual(len(store.snapshot()), 1)
+            self.assertEqual(store.forget("it"), [])
+
+            reloaded = VOICE_CHATBOT.ImportantMemoryStore(memory_path)
+            self.assertEqual([item["text"] for item in reloaded.snapshot()], ["My name is Yenjie."])
+
+            confirmed = VOICE_CHATBOT.execute_memory_command(
+                reloaded,
+                {"action": "clear_confirm", "target": ""},
+                "en",
+                clear_confirmed=True,
+            )
+            self.assertIn("all 1 memories", confirmed["text"])
+            self.assertEqual(reloaded.snapshot(), [])
+            self.assertEqual(VOICE_CHATBOT.ImportantMemoryStore(memory_path).snapshot(), [])
+
+    def test_memory_retrieval_selects_relevant_bilingual_facts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = VOICE_CHATBOT.ImportantMemoryStore(Path(temp_dir) / "memory.json")
+            for text, language in (
+                ("My name is Yenjie.", "en"),
+                ("I like green tea.", "en"),
+                ("I prefer short answers.", "en"),
+                ("我住在紐約。", "zh"),
+            ):
+                store.remember(VOICE_CHATBOT.extract_important_memory(text, language))
+
+            likes = [item["text"] for item in store.relevant_memories("What do I like?")]
+            location = [item["text"] for item in store.relevant_memories("我住在哪裡？")]
+            unrelated = [
+                item["text"]
+                for item in store.relevant_memories("How far away is Saturn?")
+            ]
+
+            self.assertIn("I like green tea.", likes)
+            self.assertNotIn("My name is Yenjie.", likes)
+            self.assertIn("我住在紐約。", location)
+            self.assertNotIn("I like green tea.", location)
+            self.assertEqual(unrelated, ["I prefer short answers."])
+
+    def test_memory_context_is_injected_into_codex_and_ollama(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = VOICE_CHATBOT.ImportantMemoryStore(Path(temp_dir) / "memory.json")
+            store.remember(
+                VOICE_CHATBOT.extract_important_memory("I like green tea.", "en")
+            )
+            store.remember(
+                VOICE_CHATBOT.extract_important_memory("My name is Yenjie.", "en")
+            )
+
+            codex = VOICE_CHATBOT.CodexCLIChat(
+                command="codex",
+                instructions="base instructions",
+                memory_store=store,
+            )
+            codex_prompt = codex._build_prompt("What do I like?")
+            self.assertIn("I like green tea.", codex_prompt)
+            self.assertNotIn("My name is Yenjie.", codex_prompt)
+
+            ollama = VOICE_CHATBOT.OllamaStreamChat.__new__(VOICE_CHATBOT.OllamaStreamChat)
+            ollama.model = "dummy"
+            ollama.url = "http://unused"
+            ollama.instructions = "base instructions"
+            ollama.memory_store = store
+            ollama.messages = [{"role": "system", "content": "base instructions"}]
+            ollama.max_messages = 8
+            ollama.response_lock = threading.Lock()
+            ollama.active_response = None
+            response = FakeOllamaResponse()
+            ollama.session = FakeOllamaSession(response)
+
+            stream = ollama.prompt("What do I like?")
+            self.assertEqual(next(stream), "partial answer")
+            system_prompt = ollama.session.last_kwargs["json"]["messages"][0]["content"]
+            self.assertIn("I like green tea.", system_prompt)
+            self.assertNotIn("My name is Yenjie.", system_prompt)
+            stream.close()
+
+    def test_memory_acknowledgement_matches_language_and_preserves_lcd_text(self):
+        tts = FakeTTS()
+        VOICE_CHATBOT.speak_memory_acknowledgement(tts, "en")
+        VOICE_CHATBOT.speak_memory_acknowledgement(tts, "zh")
+
+        self.assertEqual(tts.say_calls[0][0], "Now I remember it.")
+        self.assertEqual(tts.say_calls[0][1]["language"], "en")
+        self.assertFalse(tts.say_calls[0][1]["show_on_lcd"])
+        self.assertEqual(tts.say_calls[1][0], "我記住了。")
+        self.assertEqual(tts.say_calls[1][1]["language"], "zh")
+        self.assertFalse(tts.say_calls[1][1]["show_on_lcd"])
 
     def test_prefetch_queue_is_bounded_and_cancellable(self):
         chat = FastDummyChat()
@@ -197,6 +464,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(fake_model.kwargs["multilingual"])
         self.assertEqual(fake_model.kwargs["language"], "en")
         self.assertEqual(fake_model.kwargs["hotwords"], "Pikachu 皮卡丘")
+        self.assertEqual(fake_model.kwargs["patience"], VOICE_CHATBOT.WHISPER_PATIENCE)
 
     def test_shared_encoder_rejects_confident_unsupported_language(self):
         raw_model = FakeCTranslateWhisper(
@@ -316,6 +584,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(proc.poll())
 
     def test_all_moods_and_activity_states_render(self):
+        self.assertEqual(set(EAR_POSES), set(VALID_MOODS))
+        self.assertEqual(len(set(EAR_POSES.values())), len(VALID_MOODS))
+
         mood_frames = {}
         for size in ((320, 240), (280, 240)):
             for mood in VALID_MOODS:

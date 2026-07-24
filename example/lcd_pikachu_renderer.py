@@ -45,6 +45,17 @@ YELLOW = "#ffd83d"
 YELLOW_LIGHT = "#ffe86b"
 CHEEK = "#ed4b3f"
 BROWN = "#8d552f"
+EAR_POSES = {
+    "neutral": ((78, 11), (145, 52), (402, 11), (335, 52)),
+    "happy": ((74, 14), (146, 50), (406, 14), (334, 50)),
+    "excited": ((54, 18), (136, 54), (426, 18), (344, 54)),
+    "thinking": ((76, 11), (145, 54), (434, 35), (356, 59)),
+    "sad": ((38, 58), (118, 64), (442, 58), (362, 64)),
+    "angry": ((60, 18), (135, 53), (420, 18), (345, 53)),
+    "sleepy": ((52, 24), (132, 58), (428, 24), (348, 58)),
+    "surprised": ((56, 15), (134, 50), (424, 15), (346, 50)),
+    "love": ((72, 13), (142, 51), (408, 13), (338, 51)),
+}
 
 
 def _heart(draw, x, y, size, fill, outline=None, width=1):
@@ -382,145 +393,56 @@ def _draw_tail(draw, mood, tick, bob, talking):
     )
 
 
+def _interpolate_point(start, end, fraction):
+    return (
+        int(round(start[0] + (end[0] - start[0]) * fraction)),
+        int(round(start[1] + (end[1] - start[1]) * fraction)),
+    )
+
+
+def _draw_single_ear(draw, outer_base, tip, inner_turn, inner_base):
+    shape = (outer_base, tip, inner_turn, inner_base)
+    draw.polygon(shape, fill=YELLOW)
+    draw.line(shape + (outer_base,), fill=INK, width=6, joint="curve")
+
+    outer_cap = _interpolate_point(tip, outer_base, 0.34)
+    inner_cap = _interpolate_point(tip, inner_turn, 0.46)
+    draw.polygon((tip, outer_cap, inner_cap), fill=INK)
+    draw.line((outer_cap, inner_cap), fill=INK, width=3)
+
+
 def _draw_ears(draw, mood, tick, bob, listening):
-    twitch_amount = 10 if mood == "excited" else 6 if mood == "surprised" else 7 if listening else 3
-    twitch_speed = 1.9 if mood == "excited" else 2.3 if listening else 6.5
-    twitch = int(math.sin(tick / twitch_speed) * twitch_amount)
-    if mood == "sad":
-        droop = int((math.sin(tick / 11.0) + 1) * 2)
-        left = (
-            (163, 100 + bob),
-            (55 + twitch, 55 + bob + droop),
-            (124 + twitch // 2, 58 + bob),
-            (205, 79 + bob),
-        )
-        right = (
-            (317, 100 + bob),
-            (425 - twitch, 55 + bob + droop),
-            (356 - twitch // 2, 58 + bob),
-            (275, 79 + bob),
-        )
-        left_tip = (
-            (55 + twitch, 55 + bob + droop),
-            (79 + twitch, 53 + bob + droop),
-            (101 + twitch // 2, 56 + bob),
-        )
-        right_tip = (
-            (425 - twitch, 55 + bob + droop),
-            (401 - twitch, 53 + bob + droop),
-            (379 - twitch // 2, 56 + bob),
-        )
-    elif mood == "sleepy":
-        left = (
-            (164, 99 + bob),
-            (70 + twitch, 12 + bob),
-            (150 + twitch // 2, 52 + bob),
-            (205, 79 + bob),
-        )
-        right = (
-            (316, 99 + bob),
-            (410 - twitch, 12 + bob),
-            (330 - twitch // 2, 52 + bob),
-            (275, 79 + bob),
-        )
-        left_tip = (
-            (70 + twitch, 12 + bob),
-            (91 + twitch, 24 + bob),
-            (113 + twitch // 2, 30 + bob),
-        )
-        right_tip = (
-            (410 - twitch, 12 + bob),
-            (389 - twitch, 24 + bob),
-            (367 - twitch // 2, 30 + bob),
-        )
-    elif mood == "happy":
-        listen_lift = 7 if listening else 0
-        left = (
-            (160, 103 + bob),
-            (99 + twitch, 14 + bob - listen_lift),
-            (158 + twitch // 2, 49 + bob),
-            (205, 79 + bob),
-        )
-        right = (
-            (320, 103 + bob),
-            (381 - twitch, 14 + bob - listen_lift),
-            (322 - twitch // 2, 49 + bob),
-            (275, 79 + bob),
-        )
-        left_tip = (
-            (99 + twitch, 14 + bob - listen_lift),
-            (117 + twitch, 29 + bob),
-            (139 + twitch // 2, 35 + bob),
-        )
-        right_tip = (
-            (381 - twitch, 14 + bob - listen_lift),
-            (363 - twitch, 29 + bob),
-            (341 - twitch // 2, 35 + bob),
-        )
-    elif mood == "thinking":
-        listen_lift = 7 if listening else 0
-        left = (
-            (160, 103 + bob),
-            (97 + twitch, 12 + bob - listen_lift),
-            (156 + twitch // 2, 61 + bob),
-            (205, 79 + bob),
-        )
-        right = (
-            (320, 103 + bob),
-            (410 - twitch, 35 + bob - listen_lift),
-            (346 - twitch // 2, 58 + bob),
-            (275, 79 + bob),
-        )
-        left_tip = (
-            (97 + twitch, 12 + bob - listen_lift),
-            (116 + twitch, 41 + bob),
-            (139 + twitch // 2, 48 + bob),
-        )
-        right_tip = (
-            (410 - twitch, 35 + bob - listen_lift),
-            (388 - twitch, 43 + bob),
-            (367 - twitch // 2, 50 + bob),
-        )
+    # Each pose uses the same broad Pikachu silhouette while changing attitude.
+    left_tip, left_turn, right_tip, right_turn = EAR_POSES[mood]
+
+    if mood == "excited":
+        twitch_amount, twitch_speed = 10, 1.9
+    elif mood == "surprised":
+        twitch_amount, twitch_speed = 7, 2.4
+    elif listening:
+        twitch_amount, twitch_speed = 7, 2.3
+    elif mood in {"sad", "sleepy"}:
+        twitch_amount, twitch_speed = 2, 8.0
     else:
-        listen_lift = 7 if listening else 0
-        left_top_x, ear_top_y = {
-            "neutral": (99, 14),
-            "excited": (90, 18),
-            "thinking": (104, 14),
-            "sad": (82, 14),
-            "angry": (108, 14),
-            "surprised": (74, 16),
-            "love": (94, 14),
-        }.get(mood, (99, 14))
-        right_top_x = 480 - left_top_x
-        left = (
-            (160, 103 + bob),
-            (left_top_x + twitch, ear_top_y + bob - listen_lift),
-            (left_top_x + 59 + twitch // 2, ear_top_y + 48 + bob),
-            (205, 79 + bob),
-        )
-        right = (
-            (320, 103 + bob),
-            (right_top_x - twitch, ear_top_y + bob - listen_lift),
-            (right_top_x - 59 - twitch // 2, ear_top_y + 48 + bob),
-            (275, 79 + bob),
-        )
-        left_tip = (
-            (left_top_x + twitch, ear_top_y + bob - listen_lift),
-            (left_top_x + 18 + twitch, ear_top_y + 28 + bob),
-            (left_top_x + 40 + twitch // 2, ear_top_y + 34 + bob),
-        )
-        right_tip = (
-            (right_top_x - twitch, ear_top_y + bob - listen_lift),
-            (right_top_x - 18 - twitch, ear_top_y + 28 + bob),
-            (right_top_x - 40 - twitch // 2, ear_top_y + 34 + bob),
-        )
-    draw.polygon(left, fill=YELLOW, outline=INK)
-    draw.line(left + (left[0],), fill=INK, width=6, joint="curve")
-    draw.polygon(right, fill=YELLOW, outline=INK)
-    draw.line(right + (right[0],), fill=INK, width=6, joint="curve")
-    draw.polygon(left_tip, fill=INK)
-    draw.polygon(right_tip, fill=INK)
+        twitch_amount, twitch_speed = 4, 6.5
+
+    twitch = int(math.sin(tick / twitch_speed) * twitch_amount)
+    listen_lift = 7 if listening and mood not in {"sad", "sleepy"} else 0
+    droop = int((math.sin(tick / 11.0) + 1) * 2) if mood == "sad" else 0
+
+    left_tip = (left_tip[0] + twitch, left_tip[1] + bob - listen_lift + droop)
+    left_turn = (left_turn[0] + twitch // 2, left_turn[1] + bob + droop // 2)
+    right_tip = (right_tip[0] - twitch, right_tip[1] + bob - listen_lift + droop)
+    right_turn = (right_turn[0] - twitch // 2, right_turn[1] + bob + droop // 2)
+
+    base_spread = 4 if mood in {"excited", "surprised", "angry"} else 0
+    left_outer = (140 - base_spread, 105 + bob)
+    left_inner = (214, 84 + bob)
+    right_outer = (340 + base_spread, 105 + bob)
+    right_inner = (266, 84 + bob)
+
+    _draw_single_ear(draw, left_outer, left_tip, left_turn, left_inner)
+    _draw_single_ear(draw, right_outer, right_tip, right_turn, right_inner)
 
 
 def _normal_eye(draw, x, y, look=0, wide=False):
